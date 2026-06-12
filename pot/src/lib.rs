@@ -16,7 +16,6 @@ use reaper_medium::{
     MasterTrackBehavior, ParamId, ReaperNormalizedFxParamValue, ReaperVolumeValue, RecordingInput,
 };
 use std::borrow::Cow;
-use std::cell::{Ref, RefMut};
 use std::error::Error;
 use std::ffi::CString;
 use std::fs;
@@ -27,7 +26,7 @@ use camino::{Utf8Path, Utf8PathBuf};
 use chrono::NaiveDateTime;
 use itertools::Itertools;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, Mutex, RwLock, RwLockReadGuard, RwLockWriteGuard};
 use std::time::{Duration, Instant};
 use wildmatch::WildMatch;
 
@@ -136,8 +135,11 @@ pub trait PotIntegration {
     // TODO-high-pot This will probably look different as soon as we seriously implement favorites.
     fn favorites(&self) -> &RwLock<PotFavorites>;
     fn set_current_fx_preset(&self, fx: Fx, preset: CurrentPreset);
-    fn exclude_list(&self) -> Ref<PotFilterExcludes>;
-    fn exclude_list_mut(&self) -> RefMut<PotFilterExcludes>;
+    /// Must be safe to call from any thread (collections are rebuilt from the pot
+    /// browser's render thread, which is not the main thread on all platforms).
+    fn exclude_list(&self) -> RwLockReadGuard<PotFilterExcludes>;
+    /// Must be safe to call from any thread (see [`Self::exclude_list`]).
+    fn exclude_list_mut(&self) -> RwLockWriteGuard<PotFilterExcludes>;
     fn notify_preset_changed(&self, id: Option<PresetId>);
     fn notify_filter_changed(&self, kind: PotFilterKind, filter: OptFilter);
     fn notify_indexes_rebuilt(&self);

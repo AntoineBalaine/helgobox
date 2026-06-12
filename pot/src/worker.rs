@@ -113,7 +113,10 @@ pub struct MainThreadSpawner;
 
 impl Spawner for MainThreadSpawner {
     fn spawn(&self, f: impl Future<Output = PotWorkerResult<()>> + Send + 'static) {
-        Global::future_support().spawn_in_main_thread_from_main_thread(f);
+        // Deliberately the from-any-thread variant: on platforms where the egui render
+        // loop doesn't run on the main thread (baseview on X11), work is dispatched from
+        // a non-main thread.
+        Global::future_support().spawn_in_main_thread(f);
     }
 }
 

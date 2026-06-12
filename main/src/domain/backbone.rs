@@ -63,7 +63,6 @@ pub struct Backbone {
     //  keep this for a while and remove.
     instances: RefCell<NonCryptoHashMap<InstanceId, WeakInstance>>,
     was_processing_keyboard_input: Cell<bool>,
-    global_pot_filter_exclude_list: RefCell<PotFilterExcludes>,
     recently_focused_fx_container: Rc<RefCell<RecentlyFocusedFxContainer>>,
     stream_deck_device_manager: RefCell<StreamDeckDeviceManager>,
     stream_decks: RefCell<NonCryptoHashMap<StreamDeckDeviceId, StreamDeck>>,
@@ -76,6 +75,10 @@ pub struct AnyThreadBackboneState {
     /// display purposes) and from the pot worker (for building the collections). Alternative would
     /// be to clone the favorites whenever we build the collections.
     pub pot_favorites: RwLock<PotFavorites>,
+    /// Thread-safe for the same reason as the favorites: the exclude list is read whenever
+    /// pot collections are rebuilt, and that can be triggered from the pot browser's
+    /// render thread, which is not the main thread on all platforms.
+    pub pot_filter_exclude_list: RwLock<PotFilterExcludes>,
 }
 
 impl AnyThreadBackboneState {
@@ -180,7 +183,6 @@ impl Backbone {
             superior_units: Default::default(),
             instances: Default::default(),
             was_processing_keyboard_input: Default::default(),
-            global_pot_filter_exclude_list: Default::default(),
             recently_focused_fx_container: Default::default(),
             stream_deck_device_manager: Default::default(),
             stream_decks: Default::default(),
@@ -548,14 +550,6 @@ impl Backbone {
 
     pub fn duration_since_time_of_start(&self) -> Duration {
         self.time_of_start.elapsed()
-    }
-
-    pub fn pot_filter_exclude_list(&self) -> Ref<PotFilterExcludes> {
-        self.global_pot_filter_exclude_list.borrow()
-    }
-
-    pub fn pot_filter_exclude_list_mut(&self) -> RefMut<PotFilterExcludes> {
-        self.global_pot_filter_exclude_list.borrow_mut()
     }
 
     /// Sets a flag that indicates that there's at least one ReaLearn mapping (in any instance)

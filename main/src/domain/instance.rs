@@ -2,7 +2,10 @@ use crate::domain::{AnyThreadBackboneState, Backbone, ProcessorContext, RealTime
 #[allow(unused_imports)]
 use anyhow::Context;
 use base::hash_util::NonCryptoHashMap;
-use base::{NamedChannelSender, SenderToNormalThread, SenderToRealTimeThread};
+use base::{
+    blocking_read_lock, blocking_write_lock, NamedChannelSender, SenderToNormalThread,
+    SenderToRealTimeThread,
+};
 use helgobox_api::persistence::PotFilterKind;
 use pot::{
     CurrentPreset, OptFilter, PotFavorites, PotFilterExcludes, PotIntegration, PotUnit, PresetId,
@@ -15,7 +18,7 @@ use std::num::ParseIntError;
 use std::rc::{Rc, Weak};
 use std::str::FromStr;
 use std::sync::atomic::{AtomicU32, Ordering};
-use std::sync::RwLock;
+use std::sync::{RwLock, RwLockReadGuard, RwLockWriteGuard};
 
 pub type SharedInstance = Rc<RefCell<Instance>>;
 pub type WeakInstance = Weak<RefCell<Instance>>;
@@ -425,12 +428,18 @@ impl PotIntegration for RealearnPotIntegration {
         ));
     }
 
-    fn exclude_list(&self) -> Ref<PotFilterExcludes> {
-        Backbone::get().pot_filter_exclude_list()
+    fn exclude_list(&self) -> RwLockReadGuard<PotFilterExcludes> {
+        blocking_read_lock(
+            &AnyThreadBackboneState::get().pot_filter_exclude_list,
+            "pot filter exclude list",
+        )
     }
 
-    fn exclude_list_mut(&self) -> RefMut<PotFilterExcludes> {
-        Backbone::get().pot_filter_exclude_list_mut()
+    fn exclude_list_mut(&self) -> RwLockWriteGuard<PotFilterExcludes> {
+        blocking_write_lock(
+            &AnyThreadBackboneState::get().pot_filter_exclude_list,
+            "pot filter exclude list mut",
+        )
     }
 
     fn notify_preset_changed(&self, id: Option<PresetId>) {
