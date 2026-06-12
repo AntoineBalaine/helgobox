@@ -340,6 +340,14 @@ impl BackboneShell {
         }
         // The API contains functions that must be around without any VST plug-in instance being active
         register_api().expect("couldn't register API");
+        // Warm up the Pot preset databases in the background. This way, the library is
+        // already scanned by the time a pot browser (built-in or script-based) opens,
+        // instead of the first open paying for the full scan. The scan runs on the pot
+        // worker; opening the databases lazily initializes the global pot DB.
+        pot::spawn_in_pot_worker(async {
+            pot::pot_db().refresh();
+            Ok(())
+        });
         // Senders and receivers are initialized here but used only when awake. Yes, they already consume memory
         // when asleep but most of them are unbounded and therefore consume a minimal amount of memory as long as
         // they are not used.
@@ -1708,14 +1716,6 @@ impl BackboneShell {
         session.borrow().ui().show_pot_browser();
     }
 
-    /// Returns the pot unit of the first Helgobox instance (the same one the built-in
-    /// Pot Browser action uses). Used by the `HB_Pot_*` ReaScript API.
-    pub fn find_first_pot_unit(&self) -> Option<pot::SharedRuntimePotUnit> {
-        let session = self.find_first_relevant_session_monitoring_first()?;
-        let instance = session.borrow().instance().clone();
-        let pot_unit = instance.borrow_mut().pot_unit().ok()?;
-        Some(pot_unit)
-    }
 
     pub fn find_first_mapping_by_learnable_source() {
         Global::future_support().spawn_in_main_thread_from_main_thread(async {

@@ -19,7 +19,6 @@
 //! the built-in Pot Browser action uses). They return -1 / 0 when no instance exists.
 #![allow(non_snake_case)]
 
-use crate::infrastructure::plugin::BackboneShell;
 use base::blocking_lock_arc;
 use helgobox_api::persistence::PotFilterKind;
 use pot::{
@@ -38,11 +37,14 @@ use std::ffi::{c_char, c_int, c_void, CStr};
 // Pot unit access
 // ============================================================================
 
-/// Runs the given function with the pot unit of the first Helgobox instance.
+/// Runs the given function with the global, instance-independent pot unit.
 ///
-/// Returns `None` if there's no Helgobox instance or its pot unit can't be loaded.
+/// The API deliberately doesn't bind to a ReaLearn instance's pot unit: browsing,
+/// filtering, previewing and loading don't need one, so the API works in an empty
+/// project. (Controller-driven browsing via ReaLearn Pot targets keeps operating on the
+/// per-instance units — those are separate worlds by design.)
 fn with_pot_unit<R>(f: impl FnOnce(&SharedRuntimePotUnit, &mut RuntimePotUnit) -> R) -> Option<R> {
-    let shared = BackboneShell::get().find_first_pot_unit()?;
+    let shared = super::standalone_pot::standalone_pot_unit().ok()?;
     let mut unit = blocking_lock_arc(&shared, "pot API");
     Some(f(&shared, &mut unit))
 }
@@ -171,7 +173,7 @@ fn parse_filter_kind(s: &CStr) -> Option<PotFilterKind> {
 // ============================================================================
 
 extern "C" fn HB_Pot_IsAvailable() -> c_int {
-    BackboneShell::get().find_first_pot_unit().is_some() as c_int
+    super::standalone_pot::standalone_pot_unit().is_ok() as c_int
 }
 unsafe extern "C" fn vararg_HB_Pot_IsAvailable(_: *mut *mut c_void, _: c_int) -> *mut c_void {
     ret_int(HB_Pot_IsAvailable())
