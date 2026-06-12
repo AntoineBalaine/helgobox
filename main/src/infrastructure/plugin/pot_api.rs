@@ -337,6 +337,13 @@ unsafe extern "C" fn vararg_HB_Pot_SetPreviewVolume(
     std::ptr::null_mut()
 }
 
+extern "C" fn HB_Pot_DarkModeEnabled() -> c_int {
+    swell_ui::Window::dark_mode_is_enabled() as c_int
+}
+unsafe extern "C" fn vararg_HB_Pot_DarkModeEnabled(_: *mut *mut c_void, _: c_int) -> *mut c_void {
+    ret_int(HB_Pot_DarkModeEnabled())
+}
+
 extern "C" fn HB_Pot_StopPreview() {
     with_pot_unit(|_, unit| {
         let _ = unit.stop_preview();
@@ -541,6 +548,7 @@ macro_rules! paste_vararg {
     (HB_Pot_PlayPreview) => { vararg_HB_Pot_PlayPreview };
     (HB_Pot_StopPreview) => { vararg_HB_Pot_StopPreview };
     (HB_Pot_HasPreview) => { vararg_HB_Pot_HasPreview };
+    (HB_Pot_DarkModeEnabled) => { vararg_HB_Pot_DarkModeEnabled };
     (HB_Pot_GetPreviewVolume) => { vararg_HB_Pot_GetPreviewVolume };
     (HB_Pot_SetPreviewVolume) => { vararg_HB_Pot_SetPreviewVolume };
     (HB_Pot_LoadPreset) => { vararg_HB_Pot_LoadPreset };
@@ -578,6 +586,8 @@ fn pot_api_fns() -> Vec<PotApiFn> {
             b"void\0\0\0Stops audio preview playback.\0";
         HB_Pot_HasPreview:
             b"int\0int\0index\0Returns 1 if the preset at the given index has an audio preview file.\0";
+        HB_Pot_DarkModeEnabled:
+            b"int\0\0\0Returns 1 if a dark UI theme fits REAPER's current appearance (based on the theme's window background on Windows/Linux, the OS setting on macOS).\0";
         HB_Pot_GetPreviewVolume:
             b"int\0\0\0Returns the preview playback volume as permille of raw gain (0-1000), or -1 if no Pot unit is available.\0";
         HB_Pot_SetPreviewVolume:

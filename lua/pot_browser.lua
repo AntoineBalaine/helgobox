@@ -38,6 +38,31 @@ local search_text = nil -- lazily initialized from the engine
 local auto_preview = true
 local volume_before_mute = nil -- non-nil while muted
 
+-- Theme handling: 'auto' follows REAPER's appearance (via HB_Pot_DarkModeEnabled),
+-- 'light'/'dark' are explicit choices. Persisted across restarts via ExtState.
+local THEME_EXT_SECTION, THEME_EXT_KEY = 'pot_browser_lua', 'theme'
+local THEME_CHOICES = { 'auto', 'light', 'dark' }
+local theme_choice = r.GetExtState(THEME_EXT_SECTION, THEME_EXT_KEY)
+if theme_choice ~= 'light' and theme_choice ~= 'dark' then theme_choice = 'auto' end
+local applied_dark = nil -- which palette is currently applied
+
+local function effective_dark()
+  if theme_choice == 'dark' then return true end
+  if theme_choice == 'light' then return false end
+  return r.HB_Pot_DarkModeEnabled() ~= 0
+end
+
+local function apply_theme_if_needed()
+  local dark = effective_dark()
+  if dark == applied_dark then return end
+  applied_dark = dark
+  if dark then
+    r.ImGui_StyleColorsDark(ctx)
+  else
+    r.ImGui_StyleColorsLight(ctx)
+  end
+end
+
 local function filter_combo(kind)
   local count = r.HB_Pot_GetFilterItemCount(kind.id)
   if count < 0 then return end
@@ -164,6 +189,18 @@ local function frame()
   r.ImGui_SameLine(ctx)
   local ap_changed, ap = r.ImGui_Checkbox(ctx, 'Auto-preview', auto_preview)
   if ap_changed then auto_preview = ap end
+  -- Theme selector (persisted)
+  r.ImGui_SameLine(ctx)
+  r.ImGui_SetNextItemWidth(ctx, 70)
+  if r.ImGui_BeginCombo(ctx, 'Theme', theme_choice) then
+    for _, choice in ipairs(THEME_CHOICES) do
+      if r.ImGui_Selectable(ctx, choice, choice == theme_choice) then
+        theme_choice = choice
+        r.SetExtState(THEME_EXT_SECTION, THEME_EXT_KEY, choice, true)
+      end
+    end
+    r.ImGui_EndCombo(ctx)
+  end
   if r.HB_Pot_IsBusy() ~= 0 then
     r.ImGui_SameLine(ctx)
     r.ImGui_Text(ctx, 'scanning...')
@@ -199,6 +236,7 @@ end
 local function loop()
   -- No initial refresh needed: Helgobox warms up the preset databases in the
   -- background at startup.
+  apply_theme_if_needed()
   r.ImGui_SetNextWindowSize(ctx, 700, 500, r.ImGui_Cond_FirstUseEver())
   local visible, open = r.ImGui_Begin(ctx, 'Pot Browser (Lua)', true)
   if visible then

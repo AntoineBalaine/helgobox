@@ -66,6 +66,8 @@ pub trait PotBrowserIntegration {
 pub struct State {
     page: Page,
     dont_show_warning_again: bool,
+    /// Theme to apply on the first frame (`true` = dark). Taken once.
+    pending_initial_dark_theme: Option<bool>,
     main_state: TopLevelMainState,
 }
 
@@ -77,7 +79,16 @@ impl AssertSend for State {}
 impl State {
     /// `show_warning` should be `!warning_was_acknowledged(...)` — checked by the host
     /// because the render code can't necessarily resolve the resource path that early.
-    pub fn new(pot_unit: SharedRuntimePotUnit, os_window: Window, show_warning: bool) -> Self {
+    ///
+    /// `dark_theme` is the effective initial theme: the host should use
+    /// [`theme_preference`] and fall back to REAPER's appearance when there's no
+    /// explicit choice.
+    pub fn new(
+        pot_unit: SharedRuntimePotUnit,
+        os_window: Window,
+        show_warning: bool,
+        dark_theme: bool,
+    ) -> Self {
         Self {
             page: if show_warning {
                 Page::Warning
@@ -85,6 +96,7 @@ impl State {
                 Page::Main
             },
             dont_show_warning_again: false,
+            pending_initial_dark_theme: Some(dark_theme),
             main_state: TopLevelMainState::new(pot_unit, os_window),
         }
     }
@@ -430,6 +442,16 @@ pub fn run_ui<I: PotBrowserIntegration>(
     integration: &I,
     frame: &ReaperFrame,
 ) {
+    // Apply the initial theme (persisted choice or REAPER appearance) on the first frame.
+    if let Some(dark) = state.pending_initial_dark_theme.take() {
+        let mut style: egui::Style = (*ctx.style()).clone();
+        style.visuals = if dark {
+            Visuals::dark()
+        } else {
+            Visuals::light()
+        };
+        ctx.set_style(style);
+    }
     match state.page {
         Page::Warning => {
             run_warning_ui(ctx, state, frame);
@@ -442,6 +464,36 @@ pub fn run_ui<I: PotBrowserIntegration>(
 /// experimental-state warning again.
 fn warning_acknowledged_marker_path(reaper_resource_dir: &Utf8Path) -> Utf8PathBuf {
     reaper_resource_dir.join("Helgoboss/Pot/browser-warning-acknowledged")
+}
+
+/// Path of the file that records an explicit theme choice ("dark" or "light").
+/// Absence of the file means: follow REAPER's appearance automatically.
+fn theme_preference_path(reaper_resource_dir: &Utf8Path) -> Utf8PathBuf {
+    reaper_resource_dir.join("Helgoboss/Pot/browser-theme")
+}
+
+/// Returns the user's persisted theme choice: `Some(true)` = dark, `Some(false)` =
+/// light, `None` = no explicit choice (follow REAPER's appearance).
+///
+/// The host should check this (any thread — plain file I/O) and pass the effective
+/// initial theme to [`State::new`].
+pub fn theme_preference(reaper_resource_dir: &Utf8Path) -> Option<bool> {
+    match fs::read_to_string(theme_preference_path(reaper_resource_dir))
+        .ok()?
+        .trim()
+    {
+        "dark" => Some(true),
+        "light" => Some(false),
+        _ => None,
+    }
+}
+
+fn persist_theme_preference(reaper_resource_dir: &Utf8Path, dark: bool) {
+    let path = theme_preference_path(reaper_resource_dir);
+    if let Some(parent) = path.parent() {
+        let _ = fs::create_dir_all(parent);
+    }
+    let _ = fs::write(&path, if dark { "dark" } else { "light" });
 }
 
 /// Returns whether the user previously chose not to see the startup warning again.
@@ -669,16 +721,19 @@ fn run_main_ui<I: PotBrowserIntegration>(
                                 // Theme button
                                 if ui
                                     .button(RichText::new("🌙").size(TOOLBAR_HEIGHT))
-                                    .on_hover_text("Switches between light and dark theme")
+                                    .on_hover_text("Switches between light and dark theme.\nThe choice is remembered across restarts. Delete the browser-theme file in the resource path's Helgoboss/Pot directory to follow REAPER's appearance again.")
                                     .clicked()
                                 {
                                     let mut style: egui::Style = (*ctx.style()).clone();
-                                    style.visuals = if style.visuals.dark_mode {
-                                        Visuals::light()
-                                    } else {
+                                    let new_dark = !style.visuals.dark_mode;
+                                    style.visuals = if new_dark {
                                         Visuals::dark()
+                                    } else {
+                                        Visuals::light()
                                     };
                                     ctx.set_style(style);
+                                    // Plain file I/O on purpose (render thread)
+                                    persist_theme_preference(&frame.resource_path, new_dark);
                                 }
                                 // Help button
                                 add_help_button(ui);

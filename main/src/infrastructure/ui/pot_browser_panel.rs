@@ -68,9 +68,11 @@ impl View for PotBrowserPanel {
 
     fn opened(self: SharedView<Self>, window: Window) -> bool {
         window.size_and_center_on_screen(0.75, 0.75);
-        let show_warning =
-            !pot_browser::warning_was_acknowledged(&reaper_high::Reaper::get().resource_path());
-        let state = State::new(self.pot_unit.clone(), window, show_warning);
+        let resource_path = reaper_high::Reaper::get().resource_path();
+        let show_warning = !pot_browser::warning_was_acknowledged(&resource_path);
+        let dark_theme = pot_browser::theme_preference(&resource_path)
+            .unwrap_or_else(Window::dark_mode_is_enabled);
+        let state = State::new(self.pot_unit.clone(), window, show_warning, dark_theme);
         let bridge = state.host_bridge();
         #[cfg(not(target_os = "linux"))]
         {
