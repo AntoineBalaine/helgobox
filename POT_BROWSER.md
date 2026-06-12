@@ -34,6 +34,13 @@ There is no `target_os` gate on the pot browser — building with `--features eg
 
 Still pending manual testing: the preset crawler (including the new "Save Preset As" scraping flow), the preview recorder, the macro-param panel with a parameter-bank preset, and the open → close → reopen cycle.
 
+### Distribution notes (Linux)
+
+The plugin links `libxdo` dynamically (via `enigo`, for the crawler's mouse automation), and the link dependency binds at `dlopen` time — a missing libxdo makes the whole plugin fail to load, even if the crawler is never used. This is documented upstream behavior (see `installation.adoc`), but two things bite in practice:
+
+- **Soname drift across distros:** Debian 13 ships `libxdo.so.3`, current Arch ships `libxdo.so.4`. A binary built on one won't load on the other without `patchelf --replace-needed libxdo.so.3 libxdo.so.4 libhelgobox.so` (or building on the target distro).
+- **Future improvement:** load libxdo lazily via `libloading` (already a workspace dependency) only when the crawler starts, trying both sonames. The plugin would then load everywhere, with a clean error toast for crawler users missing the library. Static linking is *not* the answer — libxdo's own X11 dependencies stay dynamic anyway, and the `libxdo-sys` build script fights static linking.
+
 See the [Linux support](#linux-support) section for full design details.
 
 ### 2. Preset crawler: "Save Preset As" dialog scraping
