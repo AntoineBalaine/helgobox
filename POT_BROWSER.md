@@ -293,6 +293,42 @@ The crash-on-repeated-open bug on Debian/Ubuntu (nih-plug issue #98, still open 
 
 ---
 
+## ReaScript API (`HB_Pot_*`)
+
+The browsing surface of the pot engine is exposed as a REAPER extension API
+(`main/src/infrastructure/plugin/pot_api.rs`), callable from Lua/EEL/Python and from
+other extensions. This enables alternative UIs — e.g. ReaImGui scripts — with
+sub-second iteration (edit script, re-run action; no recompile, no REAPER restart).
+
+Design notes:
+
+- All functions operate on the pot unit of the **first Helgobox instance** (same as the
+  built-in browser action). They return -1/0 when no instance exists.
+- Iteration is count + by-index; strings go through caller buffers (REAPER convention —
+  Lua sees them as plain return values).
+- Filter kinds are addressed by name (`"database"`, `"bank"`, `"category"`, …); filter
+  *items* by index into the current collection, so the internal `Fil` ID space never
+  crosses the ABI.
+- Preset field lookups can hit SQLite, so a per-revision cache sits behind
+  `GetPresetName/Product/FileExt` — per-frame queries of visible rows are cheap.
+- ReaScript always calls on the main thread, so none of the egui browser's
+  threading machinery is involved — functions lock the pot unit directly.
+- Each function is registered three ways: `API_*` (extensions), `APIvararg_*`
+  (ReaScript), `APIdef_*` (docs/signatures). The vararg shims are hand-written.
+
+Functions: `IsAvailable`, `Refresh`, `IsBusy`, `GetPresetCount`,
+`GetPresetName/Product/FileExt(index)`, `Get/SetSelectedPresetIndex`,
+`PlayPreview(index)`, `StopPreview`, `LoadPreset(index)`,
+`GetFilterItemCount/Name(kind, …)`, `Get/SetFilter(kind, …)`,
+`Get/SetSearchText`. Crawler and preview recorder are deliberately not exposed —
+they're wizards, deeply tied to the Rust side, and stay in the egui UI.
+
+A demo browser lives at `lua/pot_browser.lua` (requires ReaImGui): search box, four
+filter combos, virtualized preset table (ImGui list clipper — only visible rows query
+the API), click to preview, double-click to load.
+
+---
+
 ## Testing
 
 ### What is tested today

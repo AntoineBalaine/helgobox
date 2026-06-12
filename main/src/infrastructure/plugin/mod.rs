@@ -1,5 +1,6 @@
 mod api_impl;
 mod backbone_shell;
+mod pot_api;
 mod debug_util;
 mod helgobox_plugin_editor;
 mod tracing_spam_filter;

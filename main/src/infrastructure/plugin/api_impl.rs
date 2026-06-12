@@ -105,5 +105,6 @@ fn register_or_unregister_api(
             Ok(())
         },
     )?;
+    super::pot_api::register_pot_api(&mut op)?;
     Ok(())
 }

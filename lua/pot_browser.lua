@@ -1,0 +1,160 @@
+-- Pot Browser (Lua/ReaImGui demo)
+--
+-- A minimal alternative UI for Helgobox's Pot preset browser engine, built on the
+-- HB_Pot_* ReaScript API. Requires:
+--   - Helgobox (with the HB_Pot_* API, i.e. this fork)
+--   - ReaImGui (install via ReaPack)
+--   - At least one Helgobox/ReaLearn instance in the project
+--
+-- This is deliberately small: it's the starting point for UX iteration, not a finished
+-- design. Edit, save, re-run the action - no recompilation, no REAPER restart.
+
+local r = reaper
+
+if not r.ImGui_CreateContext then
+  r.MB('This script requires ReaImGui (install via ReaPack).', 'Pot Browser', 0)
+  return
+end
+if not r.HB_Pot_IsAvailable then
+  r.MB('This script requires Helgobox with the HB_Pot_* API.', 'Pot Browser', 0)
+  return
+end
+
+local ctx = r.ImGui_CreateContext('Pot Browser (Lua)')
+local clipper = r.ImGui_CreateListClipper(ctx)
+r.ImGui_Attach(ctx, clipper)
+
+-- Filter kinds shown as combos, in order. Extend freely - any kind name from the API
+-- docs works: database, bank, sub_bank, category, sub_category, mode, product_kind,
+-- is_user, is_favorite, has_preview, is_available, is_supported, project.
+local FILTER_KINDS = {
+  { id = 'database', label = 'Database' },
+  { id = 'bank', label = 'Product' },
+  { id = 'category', label = 'Type' },
+  { id = 'mode', label = 'Character' },
+}
+
+local search_text = nil -- lazily initialized from the engine
+local refreshed_once = false
+
+local function filter_combo(kind)
+  local count = r.HB_Pot_GetFilterItemCount(kind.id)
+  if count < 0 then return end
+  local current = r.HB_Pot_GetFilter(kind.id)
+  local current_label = '<Any>'
+  if current >= 0 then
+    local ok, name = r.HB_Pot_GetFilterItemName(kind.id, current)
+    if ok ~= 0 then current_label = name end
+  end
+  r.ImGui_SetNextItemWidth(ctx, 170)
+  if r.ImGui_BeginCombo(ctx, kind.label, current_label) then
+    if r.ImGui_Selectable(ctx, '<Any>', current < 0) then
+      r.HB_Pot_SetFilter(kind.id, -1)
+    end
+    for i = 0, count - 1 do
+      local ok, name = r.HB_Pot_GetFilterItemName(kind.id, i)
+      if ok ~= 0 then
+        if r.ImGui_Selectable(ctx, name .. '##' .. i, i == current) then
+          r.HB_Pot_SetFilter(kind.id, i)
+        end
+      end
+    end
+    r.ImGui_EndCombo(ctx)
+  end
+end
+
+local function preset_table()
+  local count = r.HB_Pot_GetPresetCount()
+  if count < 0 then
+    r.ImGui_Text(ctx, 'No Helgobox instance found. Add ReaLearn to a track first.')
+    return
+  end
+  local selected = r.HB_Pot_GetSelectedPresetIndex()
+  local flags = r.ImGui_TableFlags_RowBg()
+      | r.ImGui_TableFlags_BordersInnerV()
+      | r.ImGui_TableFlags_ScrollY()
+  if r.ImGui_BeginTable(ctx, 'presets', 3, flags) then
+    r.ImGui_TableSetupColumn(ctx, 'Name', r.ImGui_TableColumnFlags_WidthStretch())
+    r.ImGui_TableSetupColumn(ctx, 'Product', r.ImGui_TableColumnFlags_WidthStretch())
+    r.ImGui_TableSetupColumn(ctx, 'Ext', r.ImGui_TableColumnFlags_WidthFixed(), 50)
+    r.ImGui_TableSetupScrollFreeze(ctx, 0, 1)
+    r.ImGui_TableHeadersRow(ctx)
+    -- The clipper means only visible rows query the API - lists with tens of
+    -- thousands of presets stay cheap.
+    r.ImGui_ListClipper_Begin(clipper, count)
+    while r.ImGui_ListClipper_Step(clipper) do
+      local first, last = r.ImGui_ListClipper_GetDisplayRange(clipper)
+      for i = first, last - 1 do
+        r.ImGui_TableNextRow(ctx)
+        r.ImGui_TableNextColumn(ctx)
+        local ok, name = r.HB_Pot_GetPresetName(i)
+        if ok == 0 then name = '...' end
+        local row_flags = r.ImGui_SelectableFlags_SpanAllColumns()
+        if r.ImGui_Selectable(ctx, name .. '##' .. i, i == selected, row_flags) then
+          r.HB_Pot_SetSelectedPresetIndex(i)
+          r.HB_Pot_PlayPreview(i)
+        end
+        if r.ImGui_IsItemHovered(ctx) and r.ImGui_IsMouseDoubleClicked(ctx, 0) then
+          r.HB_Pot_LoadPreset(i)
+        end
+        r.ImGui_TableNextColumn(ctx)
+        local ok2, product = r.HB_Pot_GetPresetProduct(i)
+        r.ImGui_Text(ctx, ok2 ~= 0 and product or '')
+        r.ImGui_TableNextColumn(ctx)
+        local ok3, ext = r.HB_Pot_GetPresetFileExt(i)
+        r.ImGui_Text(ctx, ok3 ~= 0 and ext or '')
+      end
+    end
+    r.ImGui_EndTable(ctx)
+  end
+end
+
+local function frame()
+  -- Toolbar
+  if r.ImGui_Button(ctx, 'Refresh') then
+    r.HB_Pot_Refresh()
+  end
+  r.ImGui_SameLine(ctx)
+  if search_text == nil then
+    local _, current = r.HB_Pot_GetSearchText()
+    search_text = current or ''
+  end
+  r.ImGui_SetNextItemWidth(ctx, 250)
+  local changed, new_text = r.ImGui_InputText(ctx, 'Search', search_text)
+  if changed then
+    search_text = new_text
+    r.HB_Pot_SetSearchText(new_text)
+  end
+  if r.HB_Pot_IsBusy() ~= 0 then
+    r.ImGui_SameLine(ctx)
+    r.ImGui_Text(ctx, 'scanning...')
+  end
+  -- Filters
+  for _, kind in ipairs(FILTER_KINDS) do
+    filter_combo(kind)
+    r.ImGui_SameLine(ctx)
+  end
+  r.ImGui_NewLine(ctx)
+  r.ImGui_Separator(ctx)
+  -- Preset list
+  preset_table()
+end
+
+local function loop()
+  -- Trigger an initial database scan once (settings aren't persisted by the engine yet)
+  if not refreshed_once and r.HB_Pot_IsAvailable() ~= 0 then
+    refreshed_once = true
+    r.HB_Pot_Refresh()
+  end
+  r.ImGui_SetNextWindowSize(ctx, 700, 500, r.ImGui_Cond_FirstUseEver())
+  local visible, open = r.ImGui_Begin(ctx, 'Pot Browser (Lua)', true)
+  if visible then
+    frame()
+    r.ImGui_End(ctx)
+  end
+  if open then
+    r.defer(loop)
+  end
+end
+
+r.defer(loop)
