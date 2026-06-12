@@ -302,8 +302,15 @@ sub-second iteration (edit script, re-run action; no recompile, no REAPER restar
 
 Design notes:
 
-- All functions operate on the pot unit of the **first Helgobox instance** (same as the
-  built-in browser action). They return -1/0 when no instance exists.
+- All functions operate on a **global, instance-independent pot unit**
+  (`main/src/infrastructure/plugin/standalone_pot.rs`). No ReaLearn VST instance needs
+  to exist in the project: the standalone unit uses a minimal `PotIntegration` whose
+  favorites/exclude list are the global ones, whose change notifications are no-ops,
+  and whose "protected FX" is a never-matching handle. Controller-driven browsing via
+  ReaLearn Pot targets keeps operating on the per-instance units — separate worlds.
+- The preset databases are warmed up in the background when the plugin binary loads
+  (`BackboneShell::init` spawns a scan on the pot worker), so the first browser open
+  doesn't pay for the initial scan.
 - Iteration is count + by-index; strings go through caller buffers (REAPER convention —
   Lua sees them as plain return values).
 - Filter kinds are addressed by name (`"database"`, `"bank"`, `"category"`, …); filter

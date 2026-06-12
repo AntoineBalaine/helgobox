@@ -35,7 +35,6 @@ local FILTER_KINDS = {
 }
 
 local search_text = nil -- lazily initialized from the engine
-local refreshed_once = false
 local auto_preview = true
 local volume_before_mute = nil -- non-nil while muted
 
@@ -198,11 +197,8 @@ local function frame()
 end
 
 local function loop()
-  -- Trigger an initial database scan once (settings aren't persisted by the engine yet)
-  if not refreshed_once and r.HB_Pot_IsAvailable() ~= 0 then
-    refreshed_once = true
-    r.HB_Pot_Refresh()
-  end
+  -- No initial refresh needed: Helgobox warms up the preset databases in the
+  -- background at startup.
   r.ImGui_SetNextWindowSize(ctx, 700, 500, r.ImGui_Cond_FirstUseEver())
   local visible, open = r.ImGui_Begin(ctx, 'Pot Browser (Lua)', true)
   if visible then
