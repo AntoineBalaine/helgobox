@@ -6,7 +6,7 @@ members = [
     "dialogs",
     "extension",
     "macros",
-    "playtime-clip-engine",
+    "playtime-clip-engine-placeholder",
     "playtime-api",
     "pot",
     "pot-browser",
@@ -36,7 +36,7 @@ reaper-macros = { git = "https://github.com/helgoboss/reaper-rs.git", branch = "
 rppxml-parser = { git = "https://github.com/helgoboss/reaper-rs.git", branch = "master" }
 swell-ui = { path = "swell-ui" }
 rx-util = { path = "rx-util" }
-playtime-clip-engine = { path = "playtime-clip-engine" }
+playtime-clip-engine = { path = "playtime-clip-engine-placeholder" }
 helgobox-api = { path = "api" }
 helgobox-macros = { path = "macros" }
 helgobox-allocator = { path = "allocator" }
@@ -72,7 +72,7 @@ tempfile = "3.1.0"
 xxhash-rust = { version = "0.8.15", features = ["xxh3"] }
 crossbeam-channel = "0.5"
 futures-timer = "3.0.2"
-metrics = "0.22.0"
+metrics = "0.24.6"
 ascii = "1.0"
 winapi = "0.3"
 bindgen = "0.69.2"
@@ -148,7 +148,7 @@ backtrace = "0.3.74"
 serde_yaml = "0.8.17"
 fasteval = { version = "0.2.4", default-features = false }
 maplit = "1.0.2"
-metrics-exporter-prometheus = { version = "0.13.0", default-features = false }
+metrics-exporter-prometheus = { version = "0.16.2", default-features = false }
 embed-resource = "2.4.1"
 sysinfo = "0.30.5"
 sys-info = "0.9.1"
@@ -267,6 +267,8 @@ vst = { git = "https://github.com/helgoboss/vst-rs.git", branch = "feature/param
 #[patch.'https://github.com/helgoboss/egui-baseview.git']
 #egui-baseview = { path = "../egui-baseview" }
 #
-## This is for temporary development with local baseview.
-#[patch.'https://github.com/helgoboss/baseview.git']
-#baseview = { path = "../baseview" }
+# Fork of baseview with X11 fixes (layout-aware keyboard input).
+# For local development against a sibling checkout, swap the line below for:
+#   baseview = { path = "../baseview" }
+[patch.'https://github.com/helgoboss/baseview.git']
+baseview = { git = "https://github.com/AntoineBalaine/baseview.git", branch = "x11-keyboard-layout" }

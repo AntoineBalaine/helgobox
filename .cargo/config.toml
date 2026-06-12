@@ -1,3 +1,10 @@
+# Cap the number of parallel rustc processes. The helgobox workspace contains some very
+# large crates that each peak at multiple GB during codegen with full debug info; running
+# one per core in parallel can run a 16 GB machine out of memory and take the whole OS
+# down with it.
+[build]
+jobs = 3
+
 # `+crt-static` enables static linking to C runtime.
 #
 # In MSVC this would be: "C/C++ => Code Generation => Multithreaded (/MT) instead of Multithreaded-DLL (/MD)"".
