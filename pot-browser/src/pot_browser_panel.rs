@@ -65,6 +65,7 @@ pub trait PotBrowserIntegration {
 #[derive(Debug)]
 pub struct State {
     page: Page,
+    dont_show_warning_again: bool,
     main_state: TopLevelMainState,
 }
 
@@ -74,9 +75,16 @@ trait AssertSend: Send {}
 impl AssertSend for State {}
 
 impl State {
-    pub fn new(pot_unit: SharedRuntimePotUnit, os_window: Window) -> Self {
+    /// `show_warning` should be `!warning_was_acknowledged(...)` — checked by the host
+    /// because the render code can't necessarily resolve the resource path that early.
+    pub fn new(pot_unit: SharedRuntimePotUnit, os_window: Window, show_warning: bool) -> Self {
         Self {
-            page: Default::default(),
+            page: if show_warning {
+                Page::Warning
+            } else {
+                Page::Main
+            },
+            dont_show_warning_again: false,
             main_state: TopLevelMainState::new(pot_unit, os_window),
         }
     }
@@ -424,13 +432,27 @@ pub fn run_ui<I: PotBrowserIntegration>(
 ) {
     match state.page {
         Page::Warning => {
-            run_warning_ui(ctx, state);
+            run_warning_ui(ctx, state, frame);
         }
         Page::Main => run_main_ui(ctx, &mut state.main_state, integration, frame),
     }
 }
 
-fn run_warning_ui(ctx: &Context, state: &mut State) {
+/// Path of the marker file that records that the user doesn't want to see the
+/// experimental-state warning again.
+fn warning_acknowledged_marker_path(reaper_resource_dir: &Utf8Path) -> Utf8PathBuf {
+    reaper_resource_dir.join("Helgoboss/Pot/browser-warning-acknowledged")
+}
+
+/// Returns whether the user previously chose not to see the startup warning again.
+///
+/// The host should check this (on any thread — it's just a file probe) and pass the
+/// result to [`State::new`].
+pub fn warning_was_acknowledged(reaper_resource_dir: &Utf8Path) -> bool {
+    warning_acknowledged_marker_path(reaper_resource_dir).exists()
+}
+
+fn run_warning_ui(ctx: &Context, state: &mut State, frame: &ReaperFrame) {
     CentralPanel::default().show(ctx, |_| {
         egui::Window::new("A word of caution")
             .resizable(false)
@@ -464,8 +486,20 @@ fn run_warning_ui(ctx: &Context, state: &mut State) {
                         .strong(),
                     );
                     ui.add_space(20.0);
+                    ui.checkbox(&mut state.dont_show_warning_again, "Don't show this again");
+                    ui.add_space(10.0);
                     let button = Button::new("I understood. Really!");
                     if ui.add(button).clicked() {
+                        if state.dont_show_warning_again {
+                            // Plain file I/O, deliberately not a REAPER API call: this
+                            // runs on the render thread.
+                            let marker_path =
+                                warning_acknowledged_marker_path(&frame.resource_path);
+                            if let Some(parent) = marker_path.parent() {
+                                let _ = fs::create_dir_all(parent);
+                            }
+                            let _ = fs::write(&marker_path, b"");
+                        }
                         state.page = Page::Main;
                     }
                 })

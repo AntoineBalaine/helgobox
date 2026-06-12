@@ -68,7 +68,9 @@ impl View for PotBrowserPanel {
 
     fn opened(self: SharedView<Self>, window: Window) -> bool {
         window.size_and_center_on_screen(0.75, 0.75);
-        let state = State::new(self.pot_unit.clone(), window);
+        let show_warning =
+            !pot_browser::warning_was_acknowledged(&reaper_high::Reaper::get().resource_path());
+        let state = State::new(self.pot_unit.clone(), window, show_warning);
         let bridge = state.host_bridge();
         #[cfg(not(target_os = "linux"))]
         {
