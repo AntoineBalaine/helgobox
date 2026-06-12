@@ -1028,15 +1028,12 @@ impl XBridgeWindow {
 unsafe impl HasRawWindowHandle for XBridgeWindow {
     fn raw_window_handle(&self) -> RawWindowHandle {
         let mut handle = raw_window_handle::XlibHandle::empty();
-        // It's important to get the X display from the parent. The bridge_window itself is a
-        // special SWELL window which doesn't give us the GdkWindow and therefore we can't obtain
-        // the xlib handle from it and as a consequence also no the X display.
-        let parent_xlib_handle = self
-            .parent_window
-            .get_xlib_handle()
-            .expect("couldn't get xlib handle of x bridge parent");
+        // baseview's X11 backend only consumes the `window` field of this handle in
+        // `open_parented` (it opens its own X display connection on its event-loop
+        // thread). Obtaining the display pointer from SWELL would require the gdk-sys
+        // dependency, which was removed for toolchain-compatibility reasons (see
+        // `get_xlib_handle`), so we deliberately leave the display null here.
         handle.window = self.x_window_id;
-        handle.display = parent_xlib_handle.display;
         RawWindowHandle::Xlib(handle)
     }
 }

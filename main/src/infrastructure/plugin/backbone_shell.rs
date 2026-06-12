@@ -303,6 +303,41 @@ impl BackboneShell {
         // TODO-medium This needs around 10 MB of RAM. Of course only once, not per instance,
         //  so not a big deal. Still, maybe could be improved?
         let _ = Reaper::setup_with_defaults(context, create_plugin_info());
+        // In debug builds, additionally print panics to stderr. The crash handler installed
+        // by the line above reports to the REAPER console only and replaces Rust's default
+        // stderr printing — inconvenient when running REAPER from a terminal, and the
+        // console output can't be copied while a render loop keeps repainting it.
+        #[cfg(debug_assertions)]
+        {
+            let console_hook = std::panic::take_hook();
+            // A panic that occurs once per frame (e.g. in render code) would flood the
+            // terminal and push the interesting first panic out of the scrollback, so
+            // repeated identical panics are only counted.
+            let last_panic: std::sync::Mutex<(String, u64)> =
+                std::sync::Mutex::new((String::new(), 0));
+            std::panic::set_hook(Box::new(move |panic_info| {
+                let msg = panic_info.to_string();
+                let mut last_panic = last_panic
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                if last_panic.0 == msg {
+                    last_panic.1 += 1;
+                    if last_panic.1.is_power_of_two() {
+                        eprintln!("(previous panic repeated {} times)", last_panic.1);
+                    }
+                } else {
+                    *last_panic = (msg, 1);
+                    eprintln!(
+                        "\n===== Helgobox panic =====\n{panic_info}\n{}",
+                        std::backtrace::Backtrace::force_capture()
+                    );
+                    // Only the first occurrence goes to the REAPER console / crash dialog.
+                    // Repeats would make the console unreadable (it repaints on every
+                    // message).
+                    console_hook(panic_info);
+                }
+            }));
+        }
         // The API contains functions that must be around without any VST plug-in instance being active
         register_api().expect("couldn't register API");
         // Senders and receivers are initialized here but used only when awake. Yes, they already consume memory

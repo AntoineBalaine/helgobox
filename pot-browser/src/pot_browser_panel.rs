@@ -20,7 +20,7 @@ use helgobox_api::persistence::PotFilterKind;
 use lru::LruCache;
 use pot::preset_crawler::{
     crawl_presets, import_crawled_presets, CrawlPresetArgs, PresetCrawlerStopReason,
-    PresetCrawlingState, SharedPresetCrawlingState,
+    PresetCrawlingState, SaveAsDialogScraping, SharedPresetCrawlingState,
 };
 use pot::preview_recorder::{
     prepare_preview_recording, record_previews, ExportPreviewOutputConfig, PreviewOutputConfig,
@@ -29,21 +29,24 @@ use pot::preview_recorder::{
 use pot::providers::projects::{ProjectDatabase, ProjectDbConfig};
 use pot::{
     create_plugin_factory_preset, find_preview_file, pot_db, spawn_in_pot_worker, ChangeHint,
-    CurrentPreset, Debounce, DestinationTrackDescriptor, FiledBasedPotPresetKind, Filters,
-    LoadAudioSampleBehavior, LoadPresetError, LoadPresetOptions, LoadPresetWindowBehavior,
-    MacroParam, MainThreadDispatcher, MainThreadSpawner, OptFilter, PersistentDatabaseId,
-    PotFavorites, PotFilterExcludes, PotFxParamId, PotPreset, PotPresetKind, PotWorkerDispatcher,
+    Debounce, DestinationTrackDescriptor, FiledBasedPotPresetKind, Filters,
+    LoadAudioSampleBehavior, LoadPresetOptions, LoadPresetWindowBehavior,
+    MainThreadDispatcher, MainThreadSpawner, OptFilter, PersistentDatabaseId,
+    PotFavorites, PotFilterExcludes, PotPreset, PotPresetKind, PotWorkerDispatcher,
     PotWorkerSpawner, PresetWithId, RuntimePotUnit, SearchField, SharedRuntimePotUnit,
     WorkerDispatcher,
 };
+use crate::reaper_commands::{ReaperCommand, UiFeedback};
+use crate::reaper_frame::{CurrentPresetPanelSnapshot, DestinationSnapshot, ReaperFrame};
 use pot::{FilterItemId, PresetId};
-use reaper_high::{Fx, FxParameter, Reaper, SliderVolume, Track};
-use reaper_medium::{ReaperNormalizedFxParamValue, ReaperVolumeValue};
+use reaper_high::{Fx, Track};
+use reaper_medium::ReaperVolumeValue;
 use std::borrow::Cow;
 use std::error::Error;
 use std::fs::File;
 use std::num::NonZeroUsize;
 use std::path::Path;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, MutexGuard, RwLock};
 use std::time::{Duration, Instant};
 use std::{fs, mem};
@@ -64,6 +67,11 @@ pub struct State {
     page: Page,
     main_state: TopLevelMainState,
 }
+
+/// On X11, the state lives on baseview's render thread, so it must be `Send`.
+/// This assertion makes any non-Send member a compile error instead of a runtime panic.
+trait AssertSend: Send {}
+impl AssertSend for State {}
 
 impl State {
     pub fn new(pot_unit: SharedRuntimePotUnit, os_window: Window) -> Self {
@@ -108,11 +116,20 @@ pub struct MainState {
     paint_continuously: bool,
     last_preset_id: Option<PresetId>,
     last_filters: Filters,
-    bank_index: u32,
+    /// Shared with [`HostBridge`]: the frame capture on the main thread needs to know
+    /// which macro-param bank is selected.
+    bank_index: Arc<AtomicU32>,
     preset_cache: PresetCache,
     dialog: Option<Dialog>,
     mouse: EnigoMouse,
     has_shown_legacy_vst3_scan_warning: bool,
+    /// REAPER-mutating commands queued by the render code, executed on the main thread
+    /// via [`process_pending_reaper_commands`].
+    command_sender: SenderToNormalThread<ReaperCommand>,
+    command_receiver: Receiver<ReaperCommand>,
+    /// Feedback from main-thread command execution, drained by the render code each frame.
+    feedback_sender: SenderToNormalThread<UiFeedback>,
+    feedback_receiver: Receiver<UiFeedback>,
 }
 
 type CustomPotWorkerDispatcher = PotWorkerDispatcher<MainState>;
@@ -133,11 +150,36 @@ enum Dialog {
     PresetCrawlerMouse {
         creation_time: Instant,
     },
+    /// Countdown for capturing the position of the plug-in's "Save Preset As" button
+    /// (only used when preset names are scraped from the save dialog).
+    PresetCrawlerMouseSaveAs {
+        creation_time: Instant,
+        fx: Fx,
+        fx_name: String,
+        next_preset_cursor_pos: MouseCursorPosition,
+        stop_if_destination_exists: bool,
+        never_stop_crawling: bool,
+    },
+    /// Countdown for capturing the position of the save dialog's "Cancel" button
+    /// (only used when preset names are scraped from the save dialog).
+    PresetCrawlerMouseCancel {
+        creation_time: Instant,
+        fx: Fx,
+        fx_name: String,
+        next_preset_cursor_pos: MouseCursorPosition,
+        save_as_button_pos: MouseCursorPosition,
+        stop_if_destination_exists: bool,
+        never_stop_crawling: bool,
+    },
     PresetCrawlerReady {
         fx: Fx,
+        /// Captured at focus time so the dialog doesn't have to ask REAPER for it.
+        fx_name: String,
         cursor_pos: MouseCursorPosition,
         stop_if_destination_exists: bool,
         never_stop_crawling: bool,
+        use_save_as_dialog: bool,
+        save_as_dialog: Option<SaveAsDialogScraping>,
     },
     PresetCrawlerFailure {
         short_msg: Cow<'static, str>,
@@ -218,12 +260,71 @@ impl Dialog {
         }
     }
 
-    fn preset_crawler_ready(fx: Fx, cursor_pos: MouseCursorPosition) -> Self {
+    fn preset_crawler_ready(fx: Fx, fx_name: String, cursor_pos: MouseCursorPosition) -> Self {
         Self::PresetCrawlerReady {
             fx,
+            fx_name,
             cursor_pos,
             stop_if_destination_exists: false,
             never_stop_crawling: false,
+            use_save_as_dialog: false,
+            save_as_dialog: None,
+        }
+    }
+
+    fn preset_crawler_mouse_save_as(
+        fx: Fx,
+        fx_name: String,
+        next_preset_cursor_pos: MouseCursorPosition,
+        stop_if_destination_exists: bool,
+        never_stop_crawling: bool,
+    ) -> Self {
+        Self::PresetCrawlerMouseSaveAs {
+            creation_time: Instant::now(),
+            fx,
+            fx_name,
+            next_preset_cursor_pos,
+            stop_if_destination_exists,
+            never_stop_crawling,
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn preset_crawler_mouse_cancel(
+        fx: Fx,
+        fx_name: String,
+        next_preset_cursor_pos: MouseCursorPosition,
+        save_as_button_pos: MouseCursorPosition,
+        stop_if_destination_exists: bool,
+        never_stop_crawling: bool,
+    ) -> Self {
+        Self::PresetCrawlerMouseCancel {
+            creation_time: Instant::now(),
+            fx,
+            fx_name,
+            next_preset_cursor_pos,
+            save_as_button_pos,
+            stop_if_destination_exists,
+            never_stop_crawling,
+        }
+    }
+
+    fn preset_crawler_ready_with_scraping(
+        fx: Fx,
+        fx_name: String,
+        cursor_pos: MouseCursorPosition,
+        stop_if_destination_exists: bool,
+        never_stop_crawling: bool,
+        save_as_dialog: SaveAsDialogScraping,
+    ) -> Self {
+        Self::PresetCrawlerReady {
+            fx,
+            fx_name,
+            cursor_pos,
+            stop_if_destination_exists,
+            never_stop_crawling,
+            use_save_as_dialog: true,
+            save_as_dialog: Some(save_as_dialog),
         }
     }
 
@@ -315,12 +416,17 @@ struct PotPresetData {
     preview_file: Option<Utf8PathBuf>,
 }
 
-pub fn run_ui<I: PotBrowserIntegration>(ctx: &Context, state: &mut State, integration: &I) {
+pub fn run_ui<I: PotBrowserIntegration>(
+    ctx: &Context,
+    state: &mut State,
+    integration: &I,
+    frame: &ReaperFrame,
+) {
     match state.page {
         Page::Warning => {
             run_warning_ui(ctx, state);
         }
-        Page::Main => run_main_ui(ctx, &mut state.main_state, integration),
+        Page::Main => run_main_ui(ctx, &mut state.main_state, integration, frame),
     }
 }
 
@@ -375,6 +481,7 @@ fn run_main_ui<I: PotBrowserIntegration>(
     ctx: &Context,
     state: &mut TopLevelMainState,
     integration: &I,
+    frame: &ReaperFrame,
 ) {
     // Poll background task results
     state.pot_worker_dispatcher.poll(&mut state.main_state);
@@ -391,8 +498,34 @@ fn run_main_ui<I: PotBrowserIntegration>(
         .main_state
         .preset_cache
         .set_pot_db_revision(pot_db().revision());
+    state
+        .main_state
+        .preset_cache
+        .set_reaper_resource_dir(&frame.resource_path);
     while let Ok(message) = state.main_state.preset_cache.receiver.try_recv() {
         state.main_state.preset_cache.process_message(message);
+    }
+    // Integrate feedback from main-thread command execution
+    while let Ok(feedback) = state.main_state.feedback_receiver.try_recv() {
+        match feedback {
+            UiFeedback::Error(msg) => report_ui_error(msg),
+            UiFeedback::UnsupportedPresetFormat {
+                file_extension,
+                is_shim_preset,
+            } => {
+                if is_shim_preset {
+                    report_ui_error(format!(
+                        "Found shim preset for unsupported original format but even the shim \
+                        seems to have an unsupported format: {file_extension}",
+                    ));
+                } else {
+                    state.main_state.dialog = Some(Dialog::general_error(
+                        "Can't open preset",
+                        UNSUPPORTED_PRESET_FORMAT_TEXT,
+                    ));
+                }
+            }
+        }
     }
     // Prepare toasts
     let toast_margin = 10.0;
@@ -418,7 +551,7 @@ fn run_main_ui<I: PotBrowserIntegration>(
             change_dialog: &mut change_dialog,
             pot_worker_dispatcher: &mut state.pot_worker_dispatcher,
             main_thread_dispatcher: &mut state.main_thread_dispatcher,
-            integration,
+            frame,
         };
         process_dialogs(input, ctx);
     }
@@ -433,34 +566,26 @@ fn run_main_ui<I: PotBrowserIntegration>(
             auto_preview: state.main_state.auto_preview,
             os_window: state.main_state.os_window,
             pot_unit: state.main_state.pot_unit.clone(),
-            dialog: &mut state.main_state.dialog,
+            command_sender: &state.main_state.command_sender,
         };
         execute_key_action(key_input, pot_unit, &mut toasts, key_action);
     }
-    let current_fx = pot_unit
-        .resolve_destination()
-        .ok()
-        .and_then(|inst| inst.get_existing().and_then(|dest| dest.resolve()));
+    let current_fx = frame.current_fx.as_ref();
     // UI
     let panel_frame = Frame::central_panel(&ctx.style());
     // Upper panel (currently loaded preset with macro controls)
-    if let Some(fx) = &current_fx {
-        integration.with_current_fx_preset(fx, |current_preset| {
-            if let Some(current_preset) = current_preset {
-                // Macro params
-                TopBottomPanel::top("top-bottom-panel")
-                    .frame(panel_frame)
-                    .min_height(50.0)
-                    .show(ctx, |ui| {
-                        show_current_preset_panel(
-                            &mut state.main_state.bank_index,
-                            fx,
-                            current_preset,
-                            ui,
-                        );
-                    });
-            }
-        });
+    if let Some(panel) = &frame.current_preset_panel {
+        TopBottomPanel::top("top-bottom-panel")
+            .frame(panel_frame)
+            .min_height(50.0)
+            .show(ctx, |ui| {
+                show_current_preset_panel(
+                    &state.main_state.bank_index,
+                    panel,
+                    &state.main_state.command_sender,
+                    ui,
+                );
+            });
     }
     // Main panel
     CentralPanel::default()
@@ -546,7 +671,11 @@ fn run_main_ui<I: PotBrowserIntegration>(
                         ui,
                         &state.main_state.last_filters,
                         &mut state.main_state.dialog,
-                        integration,
+                        &FilterInput {
+                            excludes: &frame.filter_excludes,
+                            command_sender: &state.main_state.command_sender,
+                        },
+                        &frame.resource_path,
                     );
                 });
             // Right pane
@@ -580,6 +709,7 @@ fn run_main_ui<I: PotBrowserIntegration>(
                                     shared_pot_unit: &state.main_state.pot_unit,
                                     show_stats: &mut state.main_state.show_stats,
                                     auto_preview: &mut state.main_state.auto_preview,
+                                    command_sender: &state.main_state.command_sender,
                                 };
                                 add_right_options_dropdown(input, ui);
                                 // Search field
@@ -657,7 +787,7 @@ fn run_main_ui<I: PotBrowserIntegration>(
                                     }
                                 },
                                 // Right side of preset info
-                                |ui, pot_unit| {
+                                |ui, _pot_unit| {
                                     let Some((preset_id, preset_data)) = current_preset_id_and_data
                                     else {
                                         return;
@@ -689,9 +819,12 @@ fn run_main_ui<I: PotBrowserIntegration>(
                                         .on_disabled_hover_text("Preset preview not available")
                                         .clicked()
                                     {
-                                        if let Err(e) = pot_unit.play_preview(preset_id) {
-                                            show_error_toast(e.to_string(), &mut toasts);
-                                        }
+                                        state
+                                            .main_state
+                                            .command_sender
+                                            .send_complaining(ReaperCommand::PlayPreview(
+                                                preset_id,
+                                            ));
                                     }
                                 },
                             );
@@ -743,24 +876,29 @@ fn run_main_ui<I: PotBrowserIntegration>(
                             75.0,
                             // Left side of destination info
                             |ui, pot_unit| {
-                                add_destination_info_panel(ui, pot_unit, integration);
+                                add_destination_info_panel(ui, pot_unit, &frame.destination);
                             },
                             // Right side of destination info
                             |ui, _| {
-                                if let Some(fx) = &current_fx {
+                                if let Some(fx) = current_fx {
                                     if ui
                                         .small_button("Chain")
                                         .on_hover_text("Shows the FX chain")
                                         .clicked()
                                     {
-                                        fx.show_in_chain().unwrap();
+                                        state.main_state.command_sender.send_complaining(
+                                            ReaperCommand::ShowFxChain(fx.clone()),
+                                        );
                                     }
                                     if ui
                                         .small_button("FX")
                                         .on_hover_text("Shows the FX")
                                         .clicked()
                                     {
-                                        let _ = fx.show_in_floating_window();
+                                        state
+                                            .main_state
+                                            .command_sender
+                                            .send_complaining(ReaperCommand::ShowFx(fx.clone()));
                                     }
                                 }
                             },
@@ -774,12 +912,13 @@ fn run_main_ui<I: PotBrowserIntegration>(
                         last_preset_id: state.main_state.last_preset_id,
                         auto_preview: state.main_state.auto_preview,
                         os_window: state.main_state.os_window,
-                        dialog: &mut state.main_state.dialog,
+                        command_sender: &state.main_state.command_sender,
                     };
                     add_preset_table(input, ui, &mut state.main_state.preset_cache);
                 });
         });
     // Other stuff
+    drain_ui_errors(&mut toasts);
     toasts.show(ctx);
     if state.main_state.paint_continuously {
         // Necessary e.g. in order to not just repaint on clicks or so but also when controller
@@ -790,7 +929,7 @@ fn run_main_ui<I: PotBrowserIntegration>(
     state.main_state.last_filters = *pot_unit.filters();
 }
 
-struct ProcessDialogsInput<'a, I: PotBrowserIntegration> {
+struct ProcessDialogsInput<'a> {
     shared_pot_unit: &'a SharedRuntimePotUnit,
     pot_unit: &'a mut RuntimePotUnit,
     dialog: &'a mut Dialog,
@@ -799,10 +938,10 @@ struct ProcessDialogsInput<'a, I: PotBrowserIntegration> {
     change_dialog: &'a mut Option<Option<Dialog>>,
     pot_worker_dispatcher: &'a mut CustomPotWorkerDispatcher,
     main_thread_dispatcher: &'a mut CustomMainThreadDispatcher,
-    integration: &'a I,
+    frame: &'a ReaperFrame,
 }
 
-fn process_dialogs<I: PotBrowserIntegration>(input: ProcessDialogsInput<I>, ctx: &Context) {
+fn process_dialogs(input: ProcessDialogsInput, ctx: &Context) {
     match input.dialog {
         Dialog::GeneralError { title, msg } => show_dialog(
             ctx,
@@ -913,12 +1052,12 @@ fn process_dialogs<I: PotBrowserIntegration>(input: ProcessDialogsInput<I>, ctx:
                     if elapsed >= PRESET_CRAWLER_COUNTDOWN_DURATION {
                         // Countdown finished
                         input.os_window.focus_first_child();
-                        let next_dialog = if let Some(fx) = Reaper::get().focused_fx() {
-                            if fx.fx.floating_window().is_some() {
-                                Dialog::preset_crawler_ready(fx.fx, p)
+                        let next_dialog = if let Some(fx) = &input.frame.focused_fx {
+                            if fx.is_open_in_floating_window {
+                                Dialog::preset_crawler_ready(fx.fx.clone(), fx.name.clone(), p)
                             } else {
                                 Dialog::preset_crawler_failure(
-                                    format!("Identified FX \"{}\" but it's not open in a floating window.", fx.fx.name()),
+                                    format!("Identified FX \"{}\" but it's not open in a floating window.", fx.name),
                                     "Please use the floating window to point the mouse to the \"Next preset\" button!",
                                 )
                             }
@@ -968,11 +1107,136 @@ fn process_dialogs<I: PotBrowserIntegration>(input: ProcessDialogsInput<I>, ctx:
                 };
             },
         ),
+        Dialog::PresetCrawlerMouseSaveAs {
+            creation_time,
+            fx,
+            fx_name,
+            next_preset_cursor_pos,
+            stop_if_destination_exists,
+            never_stop_crawling,
+        } => match input.mouse.cursor_position() {
+            Ok(p) => show_dialog(
+                ctx,
+                PRESET_CRAWLER_TITLE,
+                input.change_dialog,
+                |ui, change_dialog| {
+                    ui.add(Label::new(PRESET_CRAWLER_MOUSE_SAVE_AS_TEXT).wrap(true));
+                    let elapsed = creation_time.elapsed();
+                    ui.horizontal(|ui| {
+                        ui.strong("Current mouse cursor position:");
+                        ui.label(format_mouse_cursor_pos(p));
+                    });
+                    ui.horizontal(|ui| {
+                        ui.strong("Countdown:");
+                        let countdown = PRESET_CRAWLER_COUNTDOWN_DURATION.saturating_sub(elapsed);
+                        ui.label(format!("{}s", countdown.as_secs()));
+                    });
+                    if elapsed >= PRESET_CRAWLER_COUNTDOWN_DURATION {
+                        // Countdown finished, "Save Preset As" button position captured
+                        *change_dialog = Some(Some(Dialog::preset_crawler_mouse_cancel(
+                            fx.clone(),
+                            fx_name.clone(),
+                            *next_preset_cursor_pos,
+                            p,
+                            *stop_if_destination_exists,
+                            *never_stop_crawling,
+                        )));
+                    }
+                },
+                |ui, change_dialog| {
+                    if ui.button("Cancel").clicked() {
+                        *change_dialog = Some(None);
+                    };
+                    if ui.button("Try again").clicked() {
+                        *change_dialog = Some(Some(Dialog::preset_crawler_mouse_save_as(
+                            fx.clone(),
+                            fx_name.clone(),
+                            *next_preset_cursor_pos,
+                            *stop_if_destination_exists,
+                            *never_stop_crawling,
+                        )));
+                    };
+                },
+            ),
+            Err(e) => {
+                *input.change_dialog = Some(Some(Dialog::preset_crawler_failure(
+                    "Sorry, capturing the mouse position failed.",
+                    e,
+                )));
+            }
+        },
+        Dialog::PresetCrawlerMouseCancel {
+            creation_time,
+            fx,
+            fx_name,
+            next_preset_cursor_pos,
+            save_as_button_pos,
+            stop_if_destination_exists,
+            never_stop_crawling,
+        } => match input.mouse.cursor_position() {
+            Ok(p) => show_dialog(
+                ctx,
+                PRESET_CRAWLER_TITLE,
+                input.change_dialog,
+                |ui, change_dialog| {
+                    ui.add(Label::new(PRESET_CRAWLER_MOUSE_CANCEL_TEXT).wrap(true));
+                    let elapsed = creation_time.elapsed();
+                    ui.horizontal(|ui| {
+                        ui.strong("Current mouse cursor position:");
+                        ui.label(format_mouse_cursor_pos(p));
+                    });
+                    ui.horizontal(|ui| {
+                        ui.strong("Countdown:");
+                        let countdown = PRESET_CRAWLER_COUNTDOWN_DURATION.saturating_sub(elapsed);
+                        ui.label(format!("{}s", countdown.as_secs()));
+                    });
+                    if elapsed >= PRESET_CRAWLER_COUNTDOWN_DURATION {
+                        // Countdown finished, "Cancel" button position captured
+                        let scraping = SaveAsDialogScraping {
+                            save_as_button_pos: *save_as_button_pos,
+                            cancel_button_pos: p,
+                        };
+                        *change_dialog = Some(Some(Dialog::preset_crawler_ready_with_scraping(
+                            fx.clone(),
+                            fx_name.clone(),
+                            *next_preset_cursor_pos,
+                            *stop_if_destination_exists,
+                            *never_stop_crawling,
+                            scraping,
+                        )));
+                    }
+                },
+                |ui, change_dialog| {
+                    if ui.button("Cancel").clicked() {
+                        *change_dialog = Some(None);
+                    };
+                    if ui.button("Try again").clicked() {
+                        *change_dialog = Some(Some(Dialog::preset_crawler_mouse_cancel(
+                            fx.clone(),
+                            fx_name.clone(),
+                            *next_preset_cursor_pos,
+                            *save_as_button_pos,
+                            *stop_if_destination_exists,
+                            *never_stop_crawling,
+                        )));
+                    };
+                },
+            ),
+            Err(e) => {
+                *input.change_dialog = Some(Some(Dialog::preset_crawler_failure(
+                    "Sorry, capturing the mouse position failed.",
+                    e,
+                )));
+            }
+        },
         Dialog::PresetCrawlerReady {
             fx,
+            fx_name,
             cursor_pos,
             stop_if_destination_exists,
             never_stop_crawling,
+            use_save_as_dialog,
+            save_as_dialog,
         } => show_dialog(
             ctx,
             PRESET_CRAWLER_TITLE,
@@ -980,8 +1244,9 @@ fn process_dialogs<I: PotBrowserIntegration>(input: ProcessDialogsInput<I>, ctx:
                 input.change_dialog,
                 stop_if_destination_exists,
                 never_stop_crawling,
+                use_save_as_dialog,
             ),
-            |ui, (_, stop_if_destination_exists, never_stop_crawling)| {
+            |ui, (_, stop_if_destination_exists, never_stop_crawling, use_save_as_dialog)| {
                 add_markdown(
                     ui,
                     PRESET_CRAWLER_READY_TEXT,
@@ -990,7 +1255,7 @@ fn process_dialogs<I: PotBrowserIntegration>(input: ProcessDialogsInput<I>, ctx:
                 ui.separator();
                 ui.horizontal(|ui| {
                     ui.strong("Plug-in to be crawled:");
-                    ui.label(fx.name().to_str());
+                    ui.label(fx_name.as_str());
                 });
                 ui.horizontal(|ui| {
                     ui.strong("Mouse cursor position to be repeatedly clicked:");
@@ -1003,15 +1268,39 @@ fn process_dialogs<I: PotBrowserIntegration>(input: ProcessDialogsInput<I>, ctx:
                     ui.checkbox(never_stop_crawling, "Never stop crawling")
                         .on_hover_text("By default, Preset Crawler stops when it guesses that the last preset has been crawled.\nSometimes, this guess is incorrect. By ticking this checkbox, you can make the crawling infinite.\nYou need to press \"Escape\" as soon as you think that all presets have been crawled.")
                 });
+                ui.horizontal(|ui| {
+                    ui.checkbox(use_save_as_dialog, "Scrape preset names from \"Save preset as...\" dialog")
+                        .on_hover_text("Use this if the plug-in doesn't expose its preset names (the crawler would see the same name for every preset).\nThe crawler will then open the plug-in's own \"Save preset as...\" dialog before each step, copy the preset name out of its name field and close the dialog again.\nThis needs the screen positions of two more buttons, which you capture in the next step.");
+                    if **use_save_as_dialog {
+                        if let Some(s) = save_as_dialog.as_ref() {
+                            ui.strong("\"Save as\" button:");
+                            ui.label(format_mouse_cursor_pos(s.save_as_button_pos));
+                            ui.strong("\"Cancel\" button:");
+                            ui.label(format_mouse_cursor_pos(s.cancel_button_pos));
+                        } else {
+                            ui.label("(button positions not captured yet)");
+                        }
+                    }
+                });
             },
-            |ui, (change_dialog, stop_if_destination_exists, never_stop_crawling)| {
+            |ui, (change_dialog, stop_if_destination_exists, never_stop_crawling, use_save_as_dialog)| {
                 if ui.button("Cancel").clicked() {
                     **change_dialog = Some(None);
                 };
                 if ui.button("Try again").clicked() {
                     **change_dialog = Some(Some(Dialog::preset_crawler_mouse()));
                 };
-                if ui.button("Start crawling").clicked() {
+                if **use_save_as_dialog && save_as_dialog.is_none() {
+                    if ui.button("Capture dialog button positions").clicked() {
+                        **change_dialog = Some(Some(Dialog::preset_crawler_mouse_save_as(
+                            fx.clone(),
+                            fx_name.clone(),
+                            *cursor_pos,
+                            **stop_if_destination_exists,
+                            **never_stop_crawling,
+                        )));
+                    }
+                } else if ui.button("Start crawling").clicked() {
                     let crawling_state = PresetCrawlingState::new();
                     let os_window = input.os_window;
                     let args = CrawlPresetArgs {
@@ -1020,6 +1309,11 @@ fn process_dialogs<I: PotBrowserIntegration>(input: ProcessDialogsInput<I>, ctx:
                         state: crawling_state.clone(),
                         stop_if_destination_exists: **stop_if_destination_exists,
                         never_stop_crawling: **never_stop_crawling,
+                        save_as_dialog: if **use_save_as_dialog {
+                            *save_as_dialog
+                        } else {
+                            None
+                        },
                         bring_focus_back_to_crawler: move || {
                             os_window.focus_first_child();
                         },
@@ -1217,7 +1511,7 @@ fn process_dialogs<I: PotBrowserIntegration>(input: ProcessDialogsInput<I>, ctx:
                 let output_config = if record_for_pot_browser_button.clicked() {
                     PreviewOutputConfig::ForPotBrowserPlayback
                 } else if record_and_export_button.clicked() {
-                    let parent_dir = os_document_or_reaper_resource_dir();
+                    let parent_dir = os_document_or_reaper_resource_dir(&input.frame.resource_path);
                     let dir_name = Local::now().format("%Y-%m-%d %H-%M-%S").to_string();
                     let base_dir = parent_dir
                         .join("Helgobox/SoundPot/Preview Exports")
@@ -1283,10 +1577,8 @@ fn process_dialogs<I: PotBrowserIntegration>(input: ProcessDialogsInput<I>, ctx:
                 if !ui.button("Continue").clicked() {
                     return;
                 }
-                let preview_rpp = get_preview_rpp_path(
-                    input.integration.pot_preview_template_path(),
-                    output_config,
-                );
+                let preview_rpp =
+                    get_preview_rpp_path(input.frame.preview_template_path, output_config);
                 let preview_rpp = match preview_rpp {
                     Ok(f) => f,
                     Err(e) => {
@@ -1512,7 +1804,7 @@ struct PresetTableInput<'a> {
     last_preset_id: Option<PresetId>,
     auto_preview: bool,
     os_window: Window,
-    dialog: &'a mut Option<Dialog>,
+    command_sender: &'a SenderToNormalThread<ReaperCommand>,
 }
 
 fn add_preset_table(mut input: PresetTableInput, ui: &mut Ui, preset_cache: &mut PresetCache) {
@@ -1602,8 +1894,7 @@ fn add_preset_table(mut input: PresetTableInput, ui: &mut Ui, preset_cache: &mut
                                     load_preset_and_regain_focus(
                                         &preset,
                                         input.os_window,
-                                        input.pot_unit,
-                                        input.toasts,
+                                        input.command_sender,
                                         LoadPresetOptions {
                                             window_behavior_override: Some(LoadPresetWindowBehavior::NeverShow),
                                             audio_sample_behavior: LoadAudioSampleBehavior {
@@ -1612,7 +1903,6 @@ fn add_preset_table(mut input: PresetTableInput, ui: &mut Ui, preset_cache: &mut
                                                 obey_note_off: true,
                                             },
                                         },
-                                        input.dialog,
                                     );
                                     ui.close_menu();
                                 }
@@ -1655,7 +1945,9 @@ fn add_preset_table(mut input: PresetTableInput, ui: &mut Ui, preset_cache: &mut
                         // What to do when clicked
                         if button.clicked() {
                             if input.auto_preview {
-                                let _ = input.pot_unit.play_preview(preset_id);
+                                input
+                                    .command_sender
+                                    .send_complaining(ReaperCommand::PlayPreview(preset_id));
                             }
                             input.pot_unit.set_preset_id(Some(preset_id));
                         }
@@ -1664,10 +1956,8 @@ fn add_preset_table(mut input: PresetTableInput, ui: &mut Ui, preset_cache: &mut
                             load_preset_and_regain_focus(
                                 &data.preset,
                                 input.os_window,
-                                input.pot_unit,
-                                input.toasts,
+                                input.command_sender,
                                 LoadPresetOptions::default(),
-                                input.dialog,
                             );
                         }
                     }
@@ -1825,17 +2115,16 @@ fn create_product_plugin_menu(input: &mut PresetTableInput, data: &PotPresetData
     });
 }
 
-fn add_destination_info_panel<I: PotBrowserIntegration>(
+fn add_destination_info_panel(
     ui: &mut Ui,
     pot_unit: &mut RuntimePotUnit,
-    integration: &I,
+    destination: &DestinationSnapshot,
 ) {
     // Track descriptor
-    let current_project = Reaper::get().current_project();
     {
         const SPECIAL_TRACK_COUNT: usize = 2;
         ui.strong("Load into");
-        let track_count = current_project.track_count();
+        let track_count = destination.track_count;
         let old_track_code = match &mut pot_unit.destination_descriptor.track {
             DestinationTrackDescriptor::SelectedTrack => 0usize,
             DestinationTrackDescriptor::MasterTrack => 1usize,
@@ -1855,10 +2144,8 @@ fn add_destination_info_panel<I: PotBrowserIntegration>(
                 0 => "<Selected track>".to_string(),
                 1 => "<Master track>".to_string(),
                 _ => {
-                    if let Some(track) =
-                        current_project.track_by_index(code as u32 - SPECIAL_TRACK_COUNT as u32)
-                    {
-                        integration.get_track_label(&track)
+                    if let Some(label) = destination.track_labels.get(code - SPECIAL_TRACK_COUNT) {
+                        label.clone()
                     } else {
                         "<New track>".to_string()
                     }
@@ -1875,27 +2162,25 @@ fn add_destination_info_panel<I: PotBrowserIntegration>(
         }
     }
     // Resolved track (if displaying it makes sense)
-    let resolved_track = pot_unit
-        .destination_descriptor
-        .track
-        .resolve(current_project);
+    // The snapshot was taken at the beginning of the frame, so right after changing the
+    // destination in the combo box above, the resolved-track display below is one frame
+    // behind. That's fine in an immediate-mode UI.
     if pot_unit.destination_descriptor.track.is_dynamic() {
         ui.label("=");
-        let caption = match resolved_track.as_ref() {
-            Ok(t) => {
-                format!("\"{}\"", integration.get_track_label(t))
+        let caption = match &destination.resolved_track_label {
+            Some(label) => {
+                format!("\"{label}\"")
             }
-            Err(_) => "None (add new)".to_string(),
+            None => "None (add new)".to_string(),
         };
         let short_caption = shorten(caption.as_str().into(), 14);
         ui.label(short_caption).on_hover_text(caption);
     }
     // FX descriptor
     {
-        if let Ok(t) = resolved_track.as_ref() {
+        if destination.resolved_track_label.is_some() {
             ui.label("at");
-            let chain = t.normal_fx_chain();
-            let fx_count = chain.fx_count();
+            let fx_count = destination.fx_names.len() as u32;
             // If configured FX index too high, set it to "new FX at end of chain".
             pot_unit.destination_descriptor.fx_index =
                 pot_unit.destination_descriptor.fx_index.min(fx_count);
@@ -1904,10 +2189,10 @@ fn add_destination_info_panel<I: PotBrowserIntegration>(
                 ui,
                 &mut fx_code,
                 fx_count as usize + 1,
-                |code| match chain.fx_by_index(code as _) {
+                |code| match destination.fx_names.get(code) {
                     None => "<New FX>".to_string(),
-                    Some(fx) => {
-                        format!("{}. {}", code + 1, fx.name())
+                    Some(name) => {
+                        format!("{}. {}", code + 1, name)
                     }
                 },
             );
@@ -1964,6 +2249,7 @@ struct RightOptionsDropdownInput<'a> {
     shared_pot_unit: &'a SharedRuntimePotUnit,
     show_stats: &'a mut bool,
     auto_preview: &'a mut bool,
+    command_sender: &'a SenderToNormalThread<ReaperCommand>,
 }
 
 fn add_right_options_dropdown(input: RightOptionsDropdownInput, ui: &mut Ui) {
@@ -2027,15 +2313,18 @@ fn add_right_options_dropdown(input: RightOptionsDropdownInput, ui: &mut Ui) {
             egui::DragValue::new(&mut new_volume_raw)
                 .speed(0.01)
                 .custom_formatter(|v, _| {
-                    // TODO-low It's useless to first convert into a slider volume
-                    SliderVolume::from_reaper_value(ReaperVolumeValue::new_panic(v)).to_string()
+                    // Formatted with plain math instead of REAPER's mk_vol_str: this runs
+                    // on the render thread and mk_vol_str is main-thread-only.
+                    format_volume_as_db(v)
                 })
                 .clamp_range(0.0..=1.0)
                 .ui(ui)
                 .on_hover_text("Change volume of the sound previews");
             let new_volume = ReaperVolumeValue::new_panic(new_volume_raw);
             if new_volume != old_volume {
-                input.pot_unit.set_preview_volume(new_volume);
+                input
+                    .command_sender
+                    .send_complaining(ReaperCommand::SetPreviewVolume(new_volume));
             }
         });
         // Name track after preset
@@ -2050,14 +2339,24 @@ fn add_right_options_dropdown(input: RightOptionsDropdownInput, ui: &mut Ui) {
     });
 }
 
-fn add_filter_panels<I: PotBrowserIntegration>(
+/// Read-only inputs for the filter panels.
+struct FilterInput<'a> {
+    /// Globally excluded filter items, from the frame snapshot.
+    excludes: &'a PotFilterExcludes,
+    /// For mutations of main-thread-only state (the exclude list).
+    command_sender: &'a SenderToNormalThread<ReaperCommand>,
+}
+
+#[allow(unused_variables)] // reaper_resource_dir is only used on Windows and Linux
+fn add_filter_panels(
     shared_unit: &SharedRuntimePotUnit,
     pot_unit: &mut RuntimePotUnit,
     auto_hide_sub_filters: bool,
     ui: &mut Ui,
     last_filters: &Filters,
     dialog: &mut Option<Dialog>,
-    integration: &I,
+    filter_input: &FilterInput,
+    reaper_resource_dir: &Utf8Path,
 ) {
     let heading_height = ui.text_style_height(&TextStyle::Heading);
     // Database
@@ -2083,7 +2382,7 @@ fn add_filter_panels<I: PotBrowserIntegration>(
                     // have an up-to-date glib but rfd uses glib-sys and this one needs a new glib.
                     #[cfg(any(target_os = "windows", target_os = "linux"))]
                     {
-                        Some(os_document_or_reaper_resource_dir())
+                        Some(os_document_or_reaper_resource_dir(reaper_resource_dir))
                     }
                 };
                 if let Some(folder) = folder {
@@ -2099,7 +2398,7 @@ fn add_filter_panels<I: PotBrowserIntegration>(
         ui,
         true,
         last_filters.get(PotFilterKind::Database),
-        integration,
+        filter_input,
     );
     // Product type
     ui.separator();
@@ -2111,7 +2410,7 @@ fn add_filter_panels<I: PotBrowserIntegration>(
         ui,
         false,
         None,
-        integration,
+        filter_input,
     );
     // Add dependent filter views
     ui.separator();
@@ -2173,7 +2472,7 @@ fn add_filter_panels<I: PotBrowserIntegration>(
                 needs_separator(),
                 false,
                 last_filters.get(PotFilterKind::Project),
-                integration,
+                filter_input,
             );
         }
         if show_banks {
@@ -2186,7 +2485,7 @@ fn add_filter_panels<I: PotBrowserIntegration>(
                 needs_separator(),
                 false,
                 last_filters.get(PotFilterKind::Bank),
-                integration,
+                filter_input,
             );
         }
         if show_sub_banks {
@@ -2199,7 +2498,7 @@ fn add_filter_panels<I: PotBrowserIntegration>(
                 needs_separator(),
                 true,
                 last_filters.get(PotFilterKind::SubBank),
-                integration,
+                filter_input,
             );
         }
         if show_categories {
@@ -2212,7 +2511,7 @@ fn add_filter_panels<I: PotBrowserIntegration>(
                 needs_separator(),
                 false,
                 last_filters.get(PotFilterKind::Category),
-                integration,
+                filter_input,
             );
         }
         if show_sub_categories {
@@ -2225,7 +2524,7 @@ fn add_filter_panels<I: PotBrowserIntegration>(
                 needs_separator(),
                 true,
                 last_filters.get(PotFilterKind::SubCategory),
-                integration,
+                filter_input,
             );
         }
         if show_modes {
@@ -2238,7 +2537,7 @@ fn add_filter_panels<I: PotBrowserIntegration>(
                 needs_separator(),
                 false,
                 last_filters.get(PotFilterKind::Mode),
-                integration,
+                filter_input,
             );
         }
     }
@@ -2318,40 +2617,41 @@ fn add_left_options_dropdown(input: LeftOptionsDropdownInput, ui: &mut Ui) {
 }
 
 fn show_current_preset_panel(
-    bank_index: &mut u32,
-    fx: &Fx,
-    current_preset: &CurrentPreset,
+    bank_index: &AtomicU32,
+    panel: &CurrentPresetPanelSnapshot,
+    command_sender: &SenderToNormalThread<ReaperCommand>,
     ui: &mut Ui,
 ) {
     ui.horizontal(|ui| {
-        ui.heading(current_preset.preset().name());
+        ui.heading(&panel.preset_name);
         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-            if current_preset.has_params() {
+            if panel.has_params {
                 // Bank picker
-                let mut new_bank_index = *bank_index as usize;
+                let old_bank_index = bank_index.load(Ordering::Relaxed);
+                let mut new_bank_index = old_bank_index as usize;
                 egui::ComboBox::from_id_source("banks").show_index(
                     ui,
                     &mut new_bank_index,
-                    current_preset.macro_param_bank_count() as usize,
+                    panel.bank_count as usize,
                     |i| {
-                        if let Some(bank) = current_preset.find_macro_param_bank_at(i as _) {
-                            format!("{}. {}", i + 1, bank.name())
-                        } else {
-                            format!("Bank {} (doesn't exist)", i + 1)
-                        }
+                        panel
+                            .bank_labels
+                            .get(i)
+                            .cloned()
+                            .unwrap_or_else(|| format!("Bank {} (doesn't exist)", i + 1))
                     },
                 );
                 let new_bank_index = new_bank_index as u32;
-                if new_bank_index != *bank_index {
-                    *bank_index = new_bank_index;
+                if new_bank_index != old_bank_index {
+                    bank_index.store(new_bank_index, Ordering::Relaxed);
                 }
                 // ui.strong("Parameter bank:");
             }
         })
     });
     // Actual macro param display
-    if current_preset.has_params() {
-        show_macro_params(ui, fx, current_preset, *bank_index);
+    if panel.has_params {
+        show_macro_params(ui, panel, command_sender);
         // Scroll handler. This must come at the end, otherwise ui_contains_pointer
         // works with a zero-sized UI!
         if ui.ui_contains_pointer() {
@@ -2363,7 +2663,8 @@ fn show_current_preset_panel(
             });
             if let Some(s) = vertical_scroll {
                 let amount = -s.signum() as i32;
-                *bank_index = bank_index.saturating_add_signed(amount);
+                let current = bank_index.load(Ordering::Relaxed);
+                bank_index.store(current.saturating_add_signed(amount), Ordering::Relaxed);
             }
         }
     }
@@ -2373,7 +2674,7 @@ struct KeyInput<'a> {
     auto_preview: bool,
     os_window: Window,
     pot_unit: SharedRuntimePotUnit,
-    dialog: &'a mut Option<Dialog>,
+    command_sender: &'a SenderToNormalThread<ReaperCommand>,
 }
 
 fn execute_key_action(
@@ -2382,13 +2683,16 @@ fn execute_key_action(
     toasts: &mut Toasts,
     key_action: KeyAction,
 ) {
+    let _ = toasts;
     match key_action {
         KeyAction::NavigateWithinPresets(amount) => {
             if let Some(next_preset_index) = pot_unit.find_next_preset_index(amount) {
                 if let Some(next_preset_id) = pot_unit.find_preset_id_at_index(next_preset_index) {
                     pot_unit.set_preset_id(Some(next_preset_id));
                     if input.auto_preview {
-                        let _ = pot_unit.play_preview(next_preset_id);
+                        input
+                            .command_sender
+                            .send_complaining(ReaperCommand::PlayPreview(next_preset_id));
                     }
                 }
             }
@@ -2398,10 +2702,8 @@ fn execute_key_action(
                 load_preset_and_regain_focus(
                     &preset,
                     input.os_window,
-                    pot_unit,
-                    toasts,
+                    input.command_sender,
                     LoadPresetOptions::default(),
-                    input.dialog,
                 );
             }
         }
@@ -2470,66 +2772,34 @@ fn determine_key_action(input: &mut InputState, dialog: &mut Option<Dialog>) -> 
     action
 }
 
-fn show_macro_params(ui: &mut Ui, fx: &Fx, current_preset: &CurrentPreset, bank_index: u32) {
+fn show_macro_params(
+    ui: &mut Ui,
+    panel: &CurrentPresetPanelSnapshot,
+    command_sender: &SenderToNormalThread<ReaperCommand>,
+) {
     // Added this UI just to not get duplicate table IDs
     ui.vertical(|ui| {
-        if let Some(bank) = current_preset.find_macro_param_bank_at(bank_index) {
+        if let Some(bank) = &panel.current_bank {
             let text_height = get_text_height(ui);
             let table = TableBuilder::new(ui)
                 .striped(false)
                 .resizable(false)
                 .cell_layout(egui::Layout::left_to_right(egui::Align::Center))
-                .columns(Column::remainder(), bank.param_count() as _)
+                .columns(Column::remainder(), bank.slots.len())
                 .vscroll(false);
-            struct CombinedParam<'a> {
-                macro_param: &'a MacroParam,
-                fx_param: Option<FxParameter>,
-                param_id: PotFxParamId,
-            }
-            let slots: Vec<_> = bank
-                .params()
-                .iter()
-                .map(|macro_param| {
-                    let fx_param = macro_param.fx_param?;
-                    let param_index = fx_param.resolved_param_index;
-                    let combined_param = CombinedParam {
-                        fx_param: {
-                            param_index.and_then(|i| {
-                                let fx_param = fx.parameter_by_index(i);
-                                if fx_param.is_available() {
-                                    Some(fx_param)
-                                } else {
-                                    None
-                                }
-                            })
-                        },
-                        macro_param,
-                        param_id: fx_param.param_id,
-                    };
-                    Some(combined_param)
-                })
-                .collect();
             table
                 .header(20.0, |mut header| {
-                    for slot in &slots {
+                    for slot in &bank.slots {
                         header.col(|ui| {
                             let Some(param) = slot else {
                                 // Empty slot yields empty column
                                 return;
                             };
                             ui.vertical(|ui| {
-                                ui.strong(param.macro_param.section.as_deref().unwrap_or_default());
-                                let resp = ui.label(&param.macro_param.name);
+                                ui.strong(&param.section);
+                                let resp = ui.label(&param.macro_name);
                                 resp.on_hover_ui(|ui| {
-                                    let hover_text = if let Some(fx_param) = &param.fx_param {
-                                        fx_param.name().map(|n| n.into_string()).unwrap_or_default()
-                                    } else {
-                                        format!(
-                                            "Mapped parameter {} doesn't exist in actual plug-in",
-                                            param.param_id
-                                        )
-                                    };
-                                    ui.label(hover_text);
+                                    ui.label(&param.hover_text);
                                 });
                             });
                         });
@@ -2537,29 +2807,34 @@ fn show_macro_params(ui: &mut Ui, fx: &Fx, current_preset: &CurrentPreset, bank_
                 })
                 .body(|mut body| {
                     body.row(text_height, |mut row| {
-                        for slot in &slots {
+                        for slot in &bank.slots {
                             row.col(|ui| {
                                 let Some(param) = slot else {
                                     // Empty slot yields empty column
                                     return;
                                 };
                                 if let Some(fx_param) = param.fx_param.as_ref() {
-                                    let old_param_value = fx_param.reaper_normalized_value();
-                                    let mut new_param_value_raw = old_param_value.get();
+                                    let mut new_param_value_raw = param.value;
                                     DragValue::new(&mut new_param_value_raw)
                                         .speed(0.01)
-                                        .custom_formatter(|v, _| {
-                                            let v = ReaperNormalizedFxParamValue::new(v);
-                                            fx_param
-                                                .format_reaper_normalized_value(v)
-                                                .unwrap_or_default()
-                                                .into_string()
+                                        .custom_formatter(|_, _| {
+                                            // The plug-in formats values, which we can't ask
+                                            // for during rendering. We show the formatted
+                                            // value from the frame snapshot; during a drag,
+                                            // it catches up one frame later (after the write
+                                            // command was executed and the next snapshot
+                                            // captured).
+                                            param.formatted_value.clone()
                                         })
                                         .clamp_range(0.0..=1.0)
                                         .ui(ui);
-                                    if new_param_value_raw != old_param_value.get() {
-                                        let _ = fx_param
-                                            .set_reaper_normalized_value(new_param_value_raw);
+                                    if new_param_value_raw != param.value {
+                                        command_sender.send_complaining(
+                                            ReaperCommand::SetFxParameter {
+                                                param: fx_param.clone(),
+                                                value: new_param_value_raw,
+                                            },
+                                        );
                                     }
                                 }
                             });
@@ -2568,7 +2843,7 @@ fn show_macro_params(ui: &mut Ui, fx: &Fx, current_preset: &CurrentPreset, bank_
                 });
         } else {
             ui.vertical_centered_justified(|ui| {
-                ui.heading(format!("Parameter bank {} doesn't exist", bank_index + 1));
+                ui.heading("Selected parameter bank doesn't exist");
             });
         };
     });
@@ -2576,6 +2851,10 @@ fn show_macro_params(ui: &mut Ui, fx: &Fx, current_preset: &CurrentPreset, bank_
 
 impl MainState {
     pub fn new(pot_unit: SharedRuntimePotUnit, os_window: Window) -> Self {
+        let (command_sender, command_receiver) =
+            SenderToNormalThread::new_unbounded_channel("pot browser reaper commands");
+        let (feedback_sender, feedback_receiver) =
+            SenderToNormalThread::new_unbounded_channel("pot browser command feedback");
         Self {
             pot_unit,
             auto_preview: true,
@@ -2585,11 +2864,69 @@ impl MainState {
             os_window,
             last_preset_id: None,
             last_filters: Default::default(),
-            bank_index: 0,
+            bank_index: Arc::new(AtomicU32::new(0)),
             preset_cache: PresetCache::new(),
             dialog: Default::default(),
             mouse: EnigoMouse::new(),
             has_shown_legacy_vst3_scan_warning: false,
+            command_sender,
+            command_receiver,
+            feedback_sender,
+            feedback_receiver,
+        }
+    }
+}
+
+/// Cheap-to-clone bundle of handles that the host needs in order to capture REAPER frames
+/// and execute queued REAPER commands on the main thread — independently of where the UI
+/// state itself lives. (On X11, the UI state lives on baseview's render thread, so the
+/// host can't reach into it; these handles are all it needs.)
+#[derive(Clone)]
+pub struct HostBridge {
+    pot_unit: SharedRuntimePotUnit,
+    bank_index: Arc<AtomicU32>,
+    command_receiver: Receiver<ReaperCommand>,
+    feedback_sender: SenderToNormalThread<UiFeedback>,
+}
+
+impl HostBridge {
+    /// Captures a snapshot of everything the render pass reads from REAPER.
+    ///
+    /// Must be called on REAPER's main thread.
+    pub fn capture_frame<I: PotBrowserIntegration>(&self, integration: &I) -> ReaperFrame {
+        ReaperFrame::capture(
+            integration,
+            &self.pot_unit,
+            self.bank_index.load(Ordering::Relaxed),
+        )
+    }
+
+    /// Executes all REAPER-mutating commands that the render code queued up.
+    ///
+    /// Must be called on REAPER's main thread. On platforms where the render loop runs on
+    /// the main thread (Windows, macOS), call it right after [`run_ui`]. On other
+    /// platforms, call it from a main-thread timer.
+    pub fn process_commands(&self) {
+        while let Ok(command) = self.command_receiver.try_recv() {
+            crate::reaper_commands::execute_reaper_command(
+                command,
+                &self.pot_unit,
+                &self.feedback_sender,
+            );
+        }
+    }
+}
+
+impl State {
+    /// Returns the handles the host needs for main-thread frame capture and command
+    /// execution. Call this before handing the state over to the window.
+    pub fn host_bridge(&self) -> HostBridge {
+        let main_state = &self.main_state.main_state;
+        HostBridge {
+            pot_unit: main_state.pot_unit.clone(),
+            bank_index: main_state.bank_index.clone(),
+            command_receiver: main_state.command_receiver.clone(),
+            feedback_sender: main_state.feedback_sender.clone(),
         }
     }
 }
@@ -2600,6 +2937,7 @@ struct PresetCache {
     sender: SenderToNormalThread<PresetCacheMessage>,
     receiver: Receiver<PresetCacheMessage>,
     pot_db_revision: u8,
+    reaper_resource_dir: Utf8PathBuf,
 }
 
 impl PresetCache {
@@ -2611,6 +2949,16 @@ impl PresetCache {
             sender,
             receiver,
             pot_db_revision: 0,
+            reaper_resource_dir: Default::default(),
+        }
+    }
+
+    /// Informs the cache about REAPER's resource directory (which it needs for finding
+    /// preview files). It comes from the frame snapshot, so the cache doesn't have to talk
+    /// to REAPER itself.
+    pub fn set_reaper_resource_dir(&mut self, dir: &Utf8Path) {
+        if self.reaper_resource_dir != dir {
+            self.reaper_resource_dir = dir.to_path_buf();
         }
     }
 
@@ -2627,7 +2975,7 @@ impl PresetCache {
 
     pub fn find_preset(&mut self, preset_id: PresetId) -> &PresetCacheEntry {
         self.lru_cache.get_or_insert(preset_id, || {
-            let reaper_resource_dir = Reaper::get().resource_path();
+            let reaper_resource_dir = self.reaper_resource_dir.clone();
             let sender = self.sender.clone();
             let pot_db_revision = self.pot_db_revision;
             spawn_in_pot_worker(async move {
@@ -2668,7 +3016,7 @@ impl PresetCache {
 }
 
 #[allow(clippy::too_many_arguments)]
-fn add_filter_view<I: PotBrowserIntegration>(
+fn add_filter_view(
     ui: &mut Ui,
     max_height: f32,
     shared_pot_unit: &SharedRuntimePotUnit,
@@ -2677,7 +3025,7 @@ fn add_filter_view<I: PotBrowserIntegration>(
     add_separator: bool,
     indent: bool,
     last_filter: OptFilter,
-    integration: &I,
+    filter_input: &FilterInput,
 ) {
     let separator_height = if add_separator {
         if indent {
@@ -2722,7 +3070,7 @@ fn add_filter_view<I: PotBrowserIntegration>(
                     ui,
                     true,
                     last_filter,
-                    integration,
+                    filter_input,
                 );
             });
         // });
@@ -2740,14 +3088,14 @@ fn add_filter_view<I: PotBrowserIntegration>(
     }
 }
 
-fn add_filter_view_content<I: PotBrowserIntegration>(
+fn add_filter_view_content(
     shared_pot_unit: &SharedRuntimePotUnit,
     pot_unit: &mut RuntimePotUnit,
     kind: PotFilterKind,
     ui: &mut Ui,
     wrapped: bool,
     last_filter: OptFilter,
-    integration: &I,
+    filter_input: &FilterInput,
 ) {
     enum UiAction {
         InOrExcludeFilter(PotFilterKind, FilterItemId, bool),
@@ -2756,7 +3104,8 @@ fn add_filter_view_content<I: PotBrowserIntegration>(
     let old_filter_item_id = pot_unit.get_filter(kind);
     let mut new_filter_item_id = old_filter_item_id;
     let render = |ui: &mut Ui| {
-        integration.with_pot_filter_exclude_list(|exclude_list| {
+        {
+            let exclude_list = filter_input.excludes;
             ui.selectable_value(&mut new_filter_item_id, None, "<Any>");
             for filter_item in pot_unit.filter_item_collections.get(kind) {
                 let mut text = RichText::new(filter_item.effective_leaf_name());
@@ -2813,7 +3162,7 @@ fn add_filter_view_content<I: PotBrowserIntegration>(
                     });
                 }
             }
-        });
+        }
     };
     if wrapped {
         ui.horizontal_wrapped(render);
@@ -2832,7 +3181,11 @@ fn add_filter_view_content<I: PotBrowserIntegration>(
     if let Some(act) = action {
         match act {
             UiAction::InOrExcludeFilter(kind, id, include) => {
-                pot_unit.include_filter_item(kind, id, include, shared_pot_unit.clone());
+                // Mutates main-thread-only ReaLearn state, so it must go through the
+                // command queue.
+                filter_input
+                    .command_sender
+                    .send_complaining(ReaperCommand::IncludeFilterItem { kind, id, include });
             }
         }
     }
@@ -2881,35 +3234,20 @@ fn add_filter_view_content_as_icons(
     }
 }
 
+/// Queues loading of the given preset (and subsequent re-focusing of the pot browser
+/// window) for execution on the main thread. Load errors arrive as [`UiFeedback`] one
+/// frame later.
 fn load_preset_and_regain_focus(
     preset: &PotPreset,
     os_window: Window,
-    pot_unit: &mut RuntimePotUnit,
-    toasts: &mut Toasts,
+    command_sender: &SenderToNormalThread<ReaperCommand>,
     options: LoadPresetOptions,
-    dialog: &mut Option<Dialog>,
 ) {
-    if let Err(e) = pot_unit.load_preset(preset, options) {
-        match e {
-            LoadPresetError::UnsupportedPresetFormat {
-                file_extension,
-                is_shim_preset,
-            } => {
-                if is_shim_preset {
-                    let text = format!(
-                        "Found shim preset for unsupported original format but even the shim
-                        seems to have an unsupported format: {file_extension}",
-                    );
-                    show_error_toast(&text, toasts);
-                } else {
-                    let text = UNSUPPORTED_PRESET_FORMAT_TEXT;
-                    *dialog = Some(Dialog::general_error("Can't open preset", text));
-                }
-            }
-            _ => process_error(&e, toasts),
-        }
-    }
-    os_window.focus_first_child();
+    command_sender.send_complaining(ReaperCommand::LoadPreset {
+        preset: Box::new(preset.clone()),
+        options,
+        os_window,
+    });
 }
 
 fn process_error(error: &dyn Error, toasts: &mut Toasts) {
@@ -3298,6 +3636,20 @@ Now you have 10 seconds to place the mouse cursor on top of the "Next preset" bu
 When it's there, simply wait, don't move the mouse.
 "#;
 
+const PRESET_CRAWLER_MOUSE_SAVE_AS_TEXT: &str = r#"
+Now you have 10 seconds to place the mouse cursor on top of the plug-in's "Save preset as..." button — the button that opens the plug-in's own save dialog.
+
+Don't click it! When the cursor is there, simply wait, don't move the mouse.
+"#;
+
+const PRESET_CRAWLER_MOUSE_CANCEL_TEXT: &str = r#"
+One more position to capture: the "Cancel" button of the save dialog.
+
+Open the save dialog yourself now by clicking the plug-in's "Save preset as..." button. Then place the mouse cursor on top of the dialog's "Cancel" button and wait, without moving the mouse.
+
+After the countdown, close the dialog again (click "Cancel") before starting to crawl.
+"#;
+
 const PRESET_CRAWLER_MOUSE_FAILURE_TEXT: &str = r#"
 Preset Crawler couldn't figure out which plug-in you want to crawl!
 
@@ -3432,10 +3784,19 @@ fn optional_string(text: Option<&str>) -> &str {
     text.unwrap_or("-")
 }
 
-fn os_document_or_reaper_resource_dir() -> Utf8PathBuf {
+/// Formats a raw REAPER volume value (a linear gain factor) as decibels.
+fn format_volume_as_db(volume: f64) -> String {
+    if volume <= 0.0 {
+        "-inf dB".to_string()
+    } else {
+        format!("{:.2} dB", 20.0 * volume.log10())
+    }
+}
+
+fn os_document_or_reaper_resource_dir(reaper_resource_dir: &Utf8Path) -> Utf8PathBuf {
     dirs::document_dir()
         .and_then(|dir| Utf8PathBuf::from_path_buf(dir).ok())
-        .unwrap_or_else(|| Reaper::get().resource_path())
+        .unwrap_or_else(|| reaper_resource_dir.to_path_buf())
 }
 
 fn get_preview_rpp_path(
@@ -3492,9 +3853,27 @@ fn open_link(thing: &str) {
 }
 
 fn open_link_fallback(link: &str) {
-    Reaper::get().show_console_msg(format!(
-        "Failed to open the following link in your browser. Please open it manually:\n\n{link}\n\n"
+    report_ui_error(format!(
+        "Failed to open the following link in your browser. Please open it manually:\n\n{link}"
     ));
+}
+
+thread_local! {
+    /// Errors that occurred in deeply nested UI code that doesn't have access to the
+    /// toasts instance. Drained into toasts at the end of each frame.
+    static PENDING_UI_ERRORS: std::cell::RefCell<Vec<String>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+fn report_ui_error(msg: String) {
+    PENDING_UI_ERRORS.with(|q| q.borrow_mut().push(msg));
+}
+
+fn drain_ui_errors(toasts: &mut Toasts) {
+    PENDING_UI_ERRORS.with(|q| {
+        for msg in q.borrow_mut().drain(..) {
+            toasts.error(msg, Duration::from_secs(10));
+        }
+    });
 }
 
 fn reveal_path(path: impl AsRef<Path>) {
@@ -3512,7 +3891,7 @@ fn reveal_path(path: impl AsRef<Path>) {
 }
 
 fn reveal_path_fallback(path: &Path) {
-    Reaper::get().show_console_msg(
-        format!("Failed to open the following path in your file manager. Please open it manually:\n\n{path:?}\n\n")
+    report_ui_error(
+        format!("Failed to open the following path in your file manager. Please open it manually:\n\n{path:?}")
     );
 }

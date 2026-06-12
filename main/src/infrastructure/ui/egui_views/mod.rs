@@ -12,6 +12,45 @@ pub fn open<S: 'static>(
     state: S,
     run_ui: impl Fn(&egui::Context, &mut S) + Send + Sync + 'static,
 ) {
+    // egui-baseview requires the state to be Send but we want to support state that is not Send,
+    // that's why we use Fragile, which checks that we access the state from the creating thread
+    // only.
+    //
+    // It's slightly inconvenient to require Send because the Advanced Script Editor has state that
+    // contains `ScriptEditorInput` which uses a Box<dyn ScriptEngine>. We would have to make this
+    // Send and this would either require some restructuring (viable but too lazy now) or make mlua
+    // use the "send" feature, which would have a big effect on the Lua integration (that would be
+    // possible but would make everything harder for no win, because we currently don't want to use Lua in
+    // any other thread than the main thread anyway).
+    // Fortunately, at least on macOS and Windows, the Send requirement of egui-baseview seems to be
+    // not really necessary since the state is only being used from the main thread anyway.
+    // With baseview for X11, it's a different story: the render loop runs on its own thread there,
+    // so accessing Fragile state would panic. Views that should work on Linux must provide
+    // genuinely Send state and use [`open_with_send_state`] instead.
+    let fragile_state = Fragile::new(state);
+    // The window handle is deliberately dropped here: on Windows and macOS (the platforms
+    // this function is used on), the render loop stops when the parent window is
+    // destroyed, as it always has.
+    let _ = open_with_send_state(window, title, fragile_state, move |ctx, state| {
+        run_ui(ctx, state.get_mut())
+    });
+}
+
+/// Like [`open`], but for state that is genuinely `Send`.
+///
+/// Use this for views that should work on platforms where baseview runs the render loop
+/// on a separate thread (X11). The render callback may then be invoked from that thread,
+/// so it must not call REAPER functions or touch other main-thread-only state.
+///
+/// Returns the baseview window handle. On X11, the host should keep it and call
+/// `close()` on it when the parent window is destroyed — the render-loop thread doesn't
+/// stop by itself when the parent goes away.
+pub fn open_with_send_state<S: Send + 'static>(
+    window: Window,
+    title: impl Into<String>,
+    state: S,
+    run_ui: impl Fn(&egui::Context, &mut S) + Send + Sync + 'static,
+) -> baseview::WindowHandle {
     let title = title.into();
     window.set_text(title.as_str());
     let window_size = window.client_size();
@@ -37,37 +76,21 @@ pub fn open<S: 'static>(
         gl_config: Some(Default::default()),
     };
     let window = get_egui_parent_window(window);
-    // egui-baseview requires the state to be Send but we want to support state that is not Send,
-    // that's why we use Fragile, which checks that we access the state from the main thread only.
-    //
-    // It's slightly inconvenient to require Send because the Advanced Script Editor has state that
-    // contains `ScriptEditorInput` which uses a Box<dyn ScriptEngine>. We would have to make this
-    // Send and this would either require some restructuring (viable but too lazy now) or make mlua
-    // use the "send" feature, which would have a big effect on the Lua integration (that would be
-    // possible but would make everything harder for no win, because we currently don't want to use Lua in
-    // any other thread than the main thread anyway).
-    // Fortunately, at least on macOS and Windows, the Send requirement of egui-baseview seems to be
-    // not really necessary since the state is only being used from the main thread anyway.
-    // It think with baseview for X11, it's a different story. It seems to be running on its own thread
-    // there. But we don't have egui enabled on Linux anyway - exactly for that reason. Because that
-    // it's not the main thread there also causes other issues. I was hoping to one day write an egui
-    // integration for X11 that just uses the main thread.
-    let fragile_state = Fragile::new(state);
     egui_baseview::EguiWindow::open_parented(
         &window,
         settings,
-        fragile_state,
-        |ctx: &egui::Context, _queue: &mut egui_baseview::Queue, _state: &mut Fragile<S>| {
+        state,
+        |ctx: &egui::Context, _queue: &mut egui_baseview::Queue, _state: &mut S| {
             firewall(|| {
                 init_ui(ctx, Window::dark_mode_is_enabled());
             });
         },
-        move |ctx: &egui::Context, _queue: &mut egui_baseview::Queue, state: &mut Fragile<S>| {
+        move |ctx: &egui::Context, _queue: &mut egui_baseview::Queue, state: &mut S| {
             firewall(|| {
-                run_ui(ctx, state.get_mut());
+                run_ui(ctx, state);
             });
         },
-    );
+    )
 }
 
 fn get_egui_parent_window(window: Window) -> SwellWindow {
