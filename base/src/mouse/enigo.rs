@@ -25,6 +25,22 @@ impl EnigoMouse {
     }
 }
 
+impl EnigoMouse {
+    /// Selects all text in the currently focused text field and copies it to the system
+    /// clipboard (Ctrl+A, Ctrl+C — Cmd+A, Cmd+C on macOS).
+    pub fn select_all_and_copy(&mut self) {
+        use enigo::KeyboardControllable;
+        #[cfg(target_os = "macos")]
+        let modifier = enigo::Key::Meta;
+        #[cfg(not(target_os = "macos"))]
+        let modifier = enigo::Key::Control;
+        self.enigo.key_down(modifier);
+        self.enigo.key_click(enigo::Key::Layout('a'));
+        self.enigo.key_click(enigo::Key::Layout('c'));
+        self.enigo.key_up(modifier);
+    }
+}
+
 fn create_device_state() -> Option<DeviceState> {
     #[cfg(target_os = "macos")]
     {

@@ -3,7 +3,7 @@ use crate::{
 };
 use base::enigo::EnigoMouse;
 use base::future_util::millis;
-use base::hash_util::NonCryptoIndexMap;
+use base::hash_util::{NonCryptoHashMap, NonCryptoIndexMap};
 use base::{blocking_lock_arc, file_util, hash_util};
 use base::{Mouse, MouseCursorPosition};
 use camino::{Utf8Path, Utf8PathBuf};
@@ -14,6 +14,7 @@ use std::fs;
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 pub type SharedPresetCrawlingState = Arc<Mutex<PresetCrawlingState>>;
 
@@ -216,7 +217,26 @@ pub struct CrawlPresetArgs<F> {
     pub state: SharedPresetCrawlingState,
     pub stop_if_destination_exists: bool,
     pub never_stop_crawling: bool,
+    /// If set, preset names are obtained by scraping the plug-in's own "Save Preset As"
+    /// dialog instead of asking the REAPER API. For plug-ins that don't expose their
+    /// preset names.
+    pub save_as_dialog: Option<SaveAsDialogScraping>,
     pub bring_focus_back_to_crawler: F,
+}
+
+/// Configuration for obtaining preset names by scraping the plug-in's own
+/// "Save Preset As" dialog.
+///
+/// Works like this: Click the plug-in's "Save Preset As" button. Wait until the dialog
+/// window appears. The dialog's name field contains the current preset name and has
+/// keyboard focus, so select everything and copy it to the clipboard. Read the clipboard.
+/// Click the dialog's "Cancel" button.
+#[derive(Copy, Clone, Debug)]
+pub struct SaveAsDialogScraping {
+    /// Where the plug-in's "Save Preset As" button sits on the screen.
+    pub save_as_button_pos: MouseCursorPosition,
+    /// Where the dialog's "Cancel" button sits on the screen (once the dialog is open).
+    pub cancel_button_pos: MouseCursorPosition,
 }
 
 pub async fn crawl_presets<F>(
@@ -243,11 +263,31 @@ where
             ));
         }
         // Get preset name
-        let name = args
-            .fx
-            .preset_name()
-            .ok_or("couldn't get preset name")?
-            .into_string();
+        let name = match &args.save_as_dialog {
+            None => args
+                .fx
+                .preset_name()
+                .ok_or("couldn't get preset name")?
+                .into_string(),
+            Some(config) => {
+                // Make sure the plug-in window is visible before clicking into it.
+                // (Called here and not inside the scrape function because holding a
+                // reference to the FX across an await point would require Fx: Sync.)
+                args.fx.show_in_floating_window()?;
+                let config = *config;
+                match scrape_preset_name_via_save_as_dialog(&mut mouse, config, &escape_catcher)
+                    .await?
+                {
+                    ScrapedName::Name(name) => name,
+                    ScrapedName::Interrupted => {
+                        return Ok(PresetCrawlingOutcome::new(
+                            chunks_file,
+                            PresetCrawlerStopReason::Interrupted,
+                        ));
+                    }
+                }
+            }
+        };
         {
             // Query chunk and save it in temporary file
             let fx_chunk = args.fx.chunk()?;
@@ -287,13 +327,131 @@ where
         }
         // Click "Next preset" button
         args.fx.show_in_floating_window()?;
-        mouse.set_cursor_position(args.next_preset_cursor_pos)?;
-        moment().await;
-        mouse.press(MouseButton::Left)?;
-        moment().await;
-        mouse.release(MouseButton::Left)?;
+        click_at(&mut mouse, args.next_preset_cursor_pos).await?;
         a_bit_longer().await;
     }
+}
+
+async fn click_at(
+    mouse: &mut EnigoMouse,
+    pos: MouseCursorPosition,
+) -> Result<(), Box<dyn Error + Send + Sync>> {
+    mouse.set_cursor_position(pos)?;
+    moment().await;
+    mouse.press(MouseButton::Left)?;
+    moment().await;
+    mouse.release(MouseButton::Left)?;
+    Ok(())
+}
+
+enum ScrapedName {
+    Name(String),
+    /// The user pressed escape while we waited for the dialog.
+    Interrupted,
+}
+
+/// Obtains the current preset name by scraping the plug-in's "Save Preset As" dialog.
+///
+/// See [`SaveAsDialogScraping`] for how this works.
+async fn scrape_preset_name_via_save_as_dialog(
+    mouse: &mut EnigoMouse,
+    config: SaveAsDialogScraping,
+    escape_catcher: &EscapeCatcher,
+) -> Result<ScrapedName, Box<dyn Error + Send + Sync>> {
+    // Snapshot the currently open windows, so we can detect the dialog appearing.
+    let windows_before = count_window_titles(window_titles()?.into_iter());
+    // Open the "Save Preset As" dialog
+    click_at(mouse, config.save_as_button_pos).await?;
+    // Wait for the dialog window to appear. Don't use a fixed sleep: plug-ins open their
+    // dialogs at very different speeds.
+    let waiting_start = Instant::now();
+    loop {
+        millis(50).await;
+        if escape_catcher.escape_was_pressed() {
+            return Ok(ScrapedName::Interrupted);
+        }
+        if waiting_start.elapsed() > SAVE_AS_DIALOG_APPEARANCE_TIMEOUT {
+            return Err("the \"Save Preset As\" dialog didn't appear in time. \
+                Is the configured button position correct?"
+                .into());
+        }
+        let after = window_titles()?;
+        if detect_new_window_title(&windows_before, &after).is_some() {
+            break;
+        }
+    }
+    // The dialog's name field contains the current preset name and usually has keyboard
+    // focus right away. Put a sentinel into the clipboard first, so we can tell whether
+    // the copy actually worked. The clipboard handle is deliberately not kept across
+    // await points (it's not Send on all platforms).
+    set_clipboard_text(CLIPBOARD_SENTINEL)?;
+    moment().await;
+    mouse.select_all_and_copy();
+    moment().await;
+    let name = clipboard_text()?;
+    // Dismiss the dialog, whatever the outcome
+    click_at(mouse, config.cancel_button_pos).await?;
+    a_bit_longer().await;
+    if name == CLIPBOARD_SENTINEL {
+        return Err("couldn't copy the preset name out of the \"Save Preset As\" dialog. \
+            Maybe the dialog's name field doesn't have keyboard focus?"
+            .into());
+    }
+    let name = name.trim();
+    if name.is_empty() {
+        return Err("the \"Save Preset As\" dialog yielded an empty preset name".into());
+    }
+    Ok(ScrapedName::Name(name.to_string()))
+}
+
+const CLIPBOARD_SENTINEL: &str = "__POT_PRESET_CRAWLER_SENTINEL__";
+const SAVE_AS_DIALOG_APPEARANCE_TIMEOUT: Duration = Duration::from_secs(10);
+
+fn set_clipboard_text(text: &str) -> Result<(), Box<dyn Error + Send + Sync>> {
+    let mut clipboard = arboard::Clipboard::new().map_err(|e| e.to_string())?;
+    clipboard.set_text(text).map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+fn clipboard_text() -> Result<String, Box<dyn Error + Send + Sync>> {
+    let mut clipboard = arboard::Clipboard::new().map_err(|e| e.to_string())?;
+    let text = clipboard.get_text().map_err(|e| e.to_string())?;
+    Ok(text)
+}
+
+/// Returns the titles of all windows that are currently open, system-wide.
+fn window_titles() -> Result<Vec<String>, Box<dyn Error + Send + Sync>> {
+    let windows = xcap::Window::all().map_err(|e| e.to_string())?;
+    Ok(windows.iter().map(|w| w.title().to_string()).collect())
+}
+
+/// Counts how often each title occurs.
+///
+/// We count occurrences instead of using a set because window titles are not unique.
+/// In particular, several windows might carry an empty title — and a freshly opened
+/// dialog might, too.
+fn count_window_titles(titles: impl Iterator<Item = String>) -> NonCryptoHashMap<String, u32> {
+    let mut counts: NonCryptoHashMap<String, u32> = Default::default();
+    for title in titles {
+        *counts.entry(title).or_default() += 1;
+    }
+    counts
+}
+
+/// Returns the title of a window that's in `after` but wasn't there before, if any.
+fn detect_new_window_title<'a>(
+    before: &NonCryptoHashMap<String, u32>,
+    after: &'a [String],
+) -> Option<&'a str> {
+    let mut seen: NonCryptoHashMap<&str, u32> = Default::default();
+    for title in after {
+        let n = seen.entry(title).or_default();
+        *n += 1;
+        if *n > before.get(title.as_str()).copied().unwrap_or(0) {
+            return Some(title);
+        }
+    }
+    None
 }
 
 fn determine_preset_file_destination(
@@ -390,4 +548,152 @@ pub enum PresetCrawlerStopReason {
     DestinationFileExists,
     PresetNameNotChangingAnymore,
     PresetNameLikeBeginning,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn preset(name: &str) -> CrawledPreset {
+        CrawledPreset {
+            name: name.to_string(),
+            offset: 0,
+            size_in_bytes: 10,
+            destination: Utf8PathBuf::from(format!("/tmp/pot-test/{name}.RfxChain")),
+        }
+    }
+
+    fn add(state: &SharedPresetCrawlingState, name: &str) -> NextCrawlStep {
+        blocking_lock_arc(state, "test").add_preset(preset(name), false)
+    }
+
+    #[test]
+    fn distinct_names_continue_and_accumulate() {
+        let state = PresetCrawlingState::new();
+        for name in ["a", "b", "c"] {
+            assert!(matches!(add(&state, name), NextCrawlStep::Continue));
+        }
+        let state = blocking_lock_arc(&state, "test");
+        assert_eq!(state.preset_count(), 3);
+        assert_eq!(state.duplicate_preset_name_count(), 0);
+        assert_eq!(state.bytes_crawled(), 30);
+    }
+
+    #[test]
+    fn intermediate_duplicate_is_skipped() {
+        let state = PresetCrawlingState::new();
+        add(&state, "a");
+        add(&state, "b");
+        // Duplicate of an earlier (non-adjacent) preset
+        add(&state, "a");
+        // Next one is fresh again, which proves "a" was an intermediate duplicate
+        add(&state, "c");
+        let state = blocking_lock_arc(&state, "test");
+        assert_eq!(state.preset_count(), 3);
+        assert_eq!(state.duplicate_preset_names(), &["a".to_string()]);
+    }
+
+    #[test]
+    fn same_name_in_a_row_is_tolerated_within_limit() {
+        let state = PresetCrawlingState::new();
+        add(&state, "a");
+        // The plug-in might crop preset names, so a few repeats are tolerated
+        for _ in 0..MAX_SAME_PRESET_NAME_IN_A_ROW_ATTEMPTS {
+            assert!(matches!(add(&state, "a"), NextCrawlStep::Continue));
+        }
+    }
+
+    #[test]
+    fn same_name_in_a_row_stops_crawling_beyond_limit() {
+        let state = PresetCrawlingState::new();
+        add(&state, "a");
+        let mut last_step = NextCrawlStep::Continue;
+        for _ in 0..=MAX_SAME_PRESET_NAME_IN_A_ROW_ATTEMPTS + 1 {
+            last_step = add(&state, "a");
+        }
+        assert!(matches!(
+            last_step,
+            NextCrawlStep::Stop(PresetCrawlerStopReason::PresetNameNotChangingAnymore)
+        ));
+    }
+
+    #[test]
+    fn wrap_around_to_beginning_stops_crawling() {
+        let state = PresetCrawlingState::new();
+        // Crawl a healthy number of distinct presets
+        let names: Vec<String> = (0..20).map(|i| format!("preset-{i}")).collect();
+        for name in &names {
+            assert!(matches!(add(&state, name), NextCrawlStep::Continue));
+        }
+        // Now the preset list wraps around to the beginning
+        let mut last_step = NextCrawlStep::Continue;
+        for name in &names {
+            last_step = add(&state, name);
+            if matches!(last_step, NextCrawlStep::Stop(_)) {
+                break;
+            }
+        }
+        assert!(matches!(
+            last_step,
+            NextCrawlStep::Stop(PresetCrawlerStopReason::PresetNameLikeBeginning)
+        ));
+    }
+
+    fn titles(titles: &[&str]) -> Vec<String> {
+        titles.iter().map(|t| t.to_string()).collect()
+    }
+
+    #[test]
+    fn detects_window_with_fresh_title() {
+        let before = count_window_titles(titles(&["REAPER", "Zebra2"]).into_iter());
+        let after = titles(&["REAPER", "Zebra2", "Save Preset"]);
+        assert_eq!(detect_new_window_title(&before, &after), Some("Save Preset"));
+    }
+
+    #[test]
+    fn detects_no_new_window_when_nothing_changed() {
+        let before = count_window_titles(titles(&["REAPER", "Zebra2"]).into_iter());
+        let after = titles(&["REAPER", "Zebra2"]);
+        assert_eq!(detect_new_window_title(&before, &after), None);
+    }
+
+    #[test]
+    fn detects_no_new_window_when_window_closed() {
+        let before = count_window_titles(titles(&["REAPER", "Zebra2"]).into_iter());
+        let after = titles(&["REAPER"]);
+        assert_eq!(detect_new_window_title(&before, &after), None);
+    }
+
+    #[test]
+    fn detects_additional_window_with_duplicate_title() {
+        // Several windows often carry an empty title; a freshly opened dialog might, too.
+        let before = count_window_titles(titles(&["REAPER", "", ""]).into_iter());
+        let after = titles(&["REAPER", "", "", ""]);
+        assert_eq!(detect_new_window_title(&before, &after), Some(""));
+    }
+
+    #[test]
+    fn ignores_replaced_window_with_known_title() {
+        // A window disappears while another one with an already-known title appears:
+        // same count, no detection. This is intended — we only react to *more* windows
+        // of a title than before.
+        let before = count_window_titles(titles(&["REAPER", "Zebra2"]).into_iter());
+        let after = titles(&["Zebra2", "REAPER"]);
+        assert_eq!(detect_new_window_title(&before, &after), None);
+    }
+
+    #[test]
+    fn never_stop_mode_records_duplicates_but_continues() {
+        let state = PresetCrawlingState::new();
+        {
+            let mut state = blocking_lock_arc(&state, "test");
+            state.add_preset(preset("a"), true);
+            for _ in 0..MAX_SAME_PRESET_NAME_IN_A_ROW_ATTEMPTS + 5 {
+                let step = state.add_preset(preset("a"), true);
+                assert!(matches!(step, NextCrawlStep::Continue));
+            }
+        }
+        let state = blocking_lock_arc(&state, "test");
+        assert_eq!(state.preset_count(), 1);
+    }
 }

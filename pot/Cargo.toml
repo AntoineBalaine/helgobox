@@ -30,6 +30,10 @@ walkdir.workspace = true
 either.workspace = true
 riff-io.workspace = true
 rusqlite = { workspace = true, features = ["bundled"] }
+# For detecting the appearance of plug-in "Save Preset As" dialogs (preset crawler)
+xcap.workspace = true
+# For reading the preset name that the crawler copies out of "Save Preset As" dialogs
+arboard.workspace = true
 rmp-serde.workspace = true
 serde_json.workspace = true
 dirs.workspace = true
