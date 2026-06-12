@@ -36,6 +36,8 @@ local FILTER_KINDS = {
 
 local search_text = nil -- lazily initialized from the engine
 local refreshed_once = false
+local auto_preview = true
+local volume_before_mute = nil -- non-nil while muted
 
 local function filter_combo(kind)
   local count = r.HB_Pot_GetFilterItemCount(kind.id)
@@ -93,7 +95,9 @@ local function preset_table()
         local row_flags = r.ImGui_SelectableFlags_SpanAllColumns()
         if r.ImGui_Selectable(ctx, name .. '##' .. i, i == selected, row_flags) then
           r.HB_Pot_SetSelectedPresetIndex(i)
-          r.HB_Pot_PlayPreview(i)
+          if auto_preview then
+            r.HB_Pot_PlayPreview(i)
+          end
         end
         if r.ImGui_IsItemHovered(ctx) and r.ImGui_IsMouseDoubleClicked(ctx, 0) then
           r.HB_Pot_LoadPreset(i)
@@ -142,8 +146,25 @@ local function frame()
     local vol_changed, new_vol = r.ImGui_SliderInt(ctx, 'Vol', vol, 0, 1000, db_label)
     if vol_changed then
       r.HB_Pot_SetPreviewVolume(new_vol)
+      volume_before_mute = nil -- manual change unmutes
+    end
+    -- Mute toggle: remembers the volume and restores it on unmute
+    r.ImGui_SameLine(ctx)
+    local muted = volume_before_mute ~= nil
+    if r.ImGui_Button(ctx, muted and 'Unmute' or 'Mute') then
+      if muted then
+        r.HB_Pot_SetPreviewVolume(volume_before_mute)
+        volume_before_mute = nil
+      else
+        volume_before_mute = vol
+        r.HB_Pot_SetPreviewVolume(0)
+      end
     end
   end
+  -- Auto-preview toggle: when off, clicking a preset only selects it
+  r.ImGui_SameLine(ctx)
+  local ap_changed, ap = r.ImGui_Checkbox(ctx, 'Auto-preview', auto_preview)
+  if ap_changed then auto_preview = ap end
   if r.HB_Pot_IsBusy() ~= 0 then
     r.ImGui_SameLine(ctx)
     r.ImGui_Text(ctx, 'scanning...')
@@ -153,6 +174,23 @@ local function frame()
     filter_combo(kind)
     r.ImGui_SameLine(ctx)
   end
+  -- Has-preview mini filter as toggle buttons (like the egui browser's mini filters).
+  -- Item 0 = "No preview", item 1 = "Has preview" (see create_filter_items_has_preview).
+  local hp_current = r.HB_Pot_GetFilter('has_preview')
+  local function hp_toggle(label, item_index)
+    local active = hp_current == item_index
+    if active then
+      r.ImGui_PushStyleColor(ctx, r.ImGui_Col_Button(),
+        r.ImGui_GetStyleColor(ctx, r.ImGui_Col_ButtonActive()))
+    end
+    if r.ImGui_Button(ctx, label) then
+      r.HB_Pot_SetFilter('has_preview', active and -1 or item_index)
+    end
+    if active then r.ImGui_PopStyleColor(ctx) end
+  end
+  hp_toggle('No prev', 0)
+  r.ImGui_SameLine(ctx)
+  hp_toggle('Has prev', 1)
   r.ImGui_NewLine(ctx)
   r.ImGui_Separator(ctx)
   -- Preset list
