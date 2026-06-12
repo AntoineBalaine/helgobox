@@ -73,10 +73,11 @@ local function preset_table()
   local flags = r.ImGui_TableFlags_RowBg()
       | r.ImGui_TableFlags_BordersInnerV()
       | r.ImGui_TableFlags_ScrollY()
-  if r.ImGui_BeginTable(ctx, 'presets', 3, flags) then
+  if r.ImGui_BeginTable(ctx, 'presets', 4, flags) then
     r.ImGui_TableSetupColumn(ctx, 'Name', r.ImGui_TableColumnFlags_WidthStretch())
     r.ImGui_TableSetupColumn(ctx, 'Product', r.ImGui_TableColumnFlags_WidthStretch())
     r.ImGui_TableSetupColumn(ctx, 'Ext', r.ImGui_TableColumnFlags_WidthFixed(), 50)
+    r.ImGui_TableSetupColumn(ctx, 'Prev', r.ImGui_TableColumnFlags_WidthFixed(), 40)
     r.ImGui_TableSetupScrollFreeze(ctx, 0, 1)
     r.ImGui_TableHeadersRow(ctx)
     -- The clipper means only visible rows query the API - lists with tens of
@@ -103,6 +104,8 @@ local function preset_table()
         r.ImGui_TableNextColumn(ctx)
         local ok3, ext = r.HB_Pot_GetPresetFileExt(i)
         r.ImGui_Text(ctx, ok3 ~= 0 and ext or '')
+        r.ImGui_TableNextColumn(ctx)
+        r.ImGui_Text(ctx, r.HB_Pot_HasPreview(i) ~= 0 and '\u{266A}' or '')
       end
     end
     r.ImGui_EndTable(ctx)
@@ -115,6 +118,10 @@ local function frame()
     r.HB_Pot_Refresh()
   end
   r.ImGui_SameLine(ctx)
+  if r.ImGui_Button(ctx, 'Stop') then
+    r.HB_Pot_StopPreview()
+  end
+  r.ImGui_SameLine(ctx)
   if search_text == nil then
     local _, current = r.HB_Pot_GetSearchText()
     search_text = current or ''
@@ -124,6 +131,18 @@ local function frame()
   if changed then
     search_text = new_text
     r.HB_Pot_SetSearchText(new_text)
+  end
+  -- Preview volume (engine stores raw gain permille; display as dB)
+  r.ImGui_SameLine(ctx)
+  r.ImGui_SetNextItemWidth(ctx, 120)
+  local vol = r.HB_Pot_GetPreviewVolume()
+  if vol >= 0 then
+    local db_label = vol == 0 and '-inf dB'
+        or string.format('%.1f dB', 20 * math.log(vol / 1000, 10))
+    local vol_changed, new_vol = r.ImGui_SliderInt(ctx, 'Vol', vol, 0, 1000, db_label)
+    if vol_changed then
+      r.HB_Pot_SetPreviewVolume(new_vol)
+    end
   end
   if r.HB_Pot_IsBusy() ~= 0 then
     r.ImGui_SameLine(ctx)

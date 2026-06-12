@@ -318,7 +318,9 @@ Design notes:
 
 Functions: `IsAvailable`, `Refresh`, `IsBusy`, `GetPresetCount`,
 `GetPresetName/Product/FileExt(index)`, `Get/SetSelectedPresetIndex`,
-`PlayPreview(index)`, `StopPreview`, `LoadPreset(index)`,
+`PlayPreview(index)`, `StopPreview`, `HasPreview(index)`,
+`Get/SetPreviewVolume` (permille of raw gain — integer ABI avoids REAPER's vararg
+double-marshalling quirks), `LoadPreset(index)`,
 `GetFilterItemCount/Name(kind, …)`, `Get/SetFilter(kind, …)`,
 `Get/SetSearchText`. Crawler and preview recorder are deliberately not exposed —
 they're wizards, deeply tied to the Rust side, and stay in the egui UI.

@@ -23,9 +23,11 @@ use crate::infrastructure::plugin::BackboneShell;
 use base::blocking_lock_arc;
 use helgobox_api::persistence::PotFilterKind;
 use pot::{
-    pot_db, ChangeHint, Debounce, LoadPresetOptions, PotPreset, PotPresetKind, PresetId,
-    RuntimePotUnit, SharedRuntimePotUnit,
+    pot_db, preview_exists, ChangeHint, Debounce, LoadPresetOptions, PotPreset, PotPresetKind,
+    PresetId, RuntimePotUnit, SharedRuntimePotUnit,
 };
+use reaper_high::Reaper;
+use reaper_medium::ReaperVolumeValue;
 use reaper_low::raw::ApiVararg;
 use reaper_medium::RegistrationObject;
 use std::cell::RefCell;
@@ -58,6 +60,7 @@ struct PresetFields {
     name: String,
     product: String,
     file_ext: String,
+    has_preview: bool,
 }
 
 thread_local! {
@@ -84,10 +87,12 @@ fn preset_fields_at(unit: &RuntimePotUnit, index: i32) -> Option<PresetFields> {
                     PotPresetKind::FileBased(k) => k.file_ext.clone(),
                     _ => String::new(),
                 };
+                let has_preview = preview_exists(&preset, &Reaper::get().resource_path());
                 Some(PresetFields {
                     name: preset.name().to_string(),
                     product: preset.common.product_name.clone().unwrap_or_default(),
                     file_ext,
+                    has_preview,
                 })
             })
             .clone()
@@ -299,6 +304,37 @@ unsafe extern "C" fn vararg_HB_Pot_PlayPreview(args: *mut *mut c_void, n: c_int)
     ret_int(HB_Pot_PlayPreview(int_arg(args, n, 0)))
 }
 
+extern "C" fn HB_Pot_HasPreview(index: c_int) -> c_int {
+    with_pot_unit(|_, unit| {
+        preset_fields_at(unit, index)
+            .map(|f| f.has_preview as c_int)
+            .unwrap_or(0)
+    })
+    .unwrap_or(0)
+}
+unsafe extern "C" fn vararg_HB_Pot_HasPreview(args: *mut *mut c_void, n: c_int) -> *mut c_void {
+    ret_int(HB_Pot_HasPreview(int_arg(args, n, 0)))
+}
+
+extern "C" fn HB_Pot_GetPreviewVolume() -> c_int {
+    with_pot_unit(|_, unit| (unit.preview_volume().get() * 1000.0).round() as c_int).unwrap_or(-1)
+}
+unsafe extern "C" fn vararg_HB_Pot_GetPreviewVolume(_: *mut *mut c_void, _: c_int) -> *mut c_void {
+    ret_int(HB_Pot_GetPreviewVolume())
+}
+
+extern "C" fn HB_Pot_SetPreviewVolume(volume_permille: c_int) {
+    let raw = (volume_permille.clamp(0, 1000) as f64) / 1000.0;
+    with_pot_unit(|_, unit| unit.set_preview_volume(ReaperVolumeValue::new_panic(raw)));
+}
+unsafe extern "C" fn vararg_HB_Pot_SetPreviewVolume(
+    args: *mut *mut c_void,
+    n: c_int,
+) -> *mut c_void {
+    HB_Pot_SetPreviewVolume(int_arg(args, n, 0));
+    std::ptr::null_mut()
+}
+
 extern "C" fn HB_Pot_StopPreview() {
     with_pot_unit(|_, unit| {
         let _ = unit.stop_preview();
@@ -502,6 +538,9 @@ macro_rules! paste_vararg {
     (HB_Pot_SetSelectedPresetIndex) => { vararg_HB_Pot_SetSelectedPresetIndex };
     (HB_Pot_PlayPreview) => { vararg_HB_Pot_PlayPreview };
     (HB_Pot_StopPreview) => { vararg_HB_Pot_StopPreview };
+    (HB_Pot_HasPreview) => { vararg_HB_Pot_HasPreview };
+    (HB_Pot_GetPreviewVolume) => { vararg_HB_Pot_GetPreviewVolume };
+    (HB_Pot_SetPreviewVolume) => { vararg_HB_Pot_SetPreviewVolume };
     (HB_Pot_LoadPreset) => { vararg_HB_Pot_LoadPreset };
     (HB_Pot_GetFilterItemCount) => { vararg_HB_Pot_GetFilterItemCount };
     (HB_Pot_GetFilterItemName) => { vararg_HB_Pot_GetFilterItemName };
@@ -535,6 +574,12 @@ fn pot_api_fns() -> Vec<PotApiFn> {
             b"int\0int\0index\0Plays the audio preview of the preset at the given index. Returns 0 if there's no preview.\0";
         HB_Pot_StopPreview:
             b"void\0\0\0Stops audio preview playback.\0";
+        HB_Pot_HasPreview:
+            b"int\0int\0index\0Returns 1 if the preset at the given index has an audio preview file.\0";
+        HB_Pot_GetPreviewVolume:
+            b"int\0\0\0Returns the preview playback volume as permille of raw gain (0-1000), or -1 if no Pot unit is available.\0";
+        HB_Pot_SetPreviewVolume:
+            b"void\0int\0volume_permille\0Sets the preview playback volume as permille of raw gain (0-1000).\0";
         HB_Pot_LoadPreset:
             b"int\0int\0index\0Loads the preset at the given index into the configured destination. Returns 0 on failure.\0";
         HB_Pot_GetFilterItemCount:
