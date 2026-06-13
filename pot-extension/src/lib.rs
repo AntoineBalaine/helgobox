@@ -33,11 +33,10 @@ fn plugin_main(context: PluginContext) -> Result<(), Box<dyn Error>> {
         };
         register_pot_api(&mut op)?;
     }
-    // Warm up the preset databases in the background so the first browser open is instant.
-    pot::spawn_in_pot_worker(async {
-        pot::pot_db().refresh();
-        Ok(())
-    });
+    // Load the standalone pot unit and kick off a full refresh (database scan + preset
+    // collection build) in the background, here at REAPER startup — so the preset list is
+    // ready before any browser opens, rather than scanning only when a UI first asks.
+    pot_api::warm_up();
     Ok(())
 }
 

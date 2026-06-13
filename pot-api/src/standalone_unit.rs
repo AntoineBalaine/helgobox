@@ -42,6 +42,36 @@ pub fn standalone_pot_unit() -> Result<SharedRuntimePotUnit, &'static str> {
     })
 }
 
+/// Loads the standalone pot unit and kicks off a full database refresh (scan + collection
+/// rebuild) in the background.
+///
+/// Call this once at extension startup, on the main thread. The scan itself runs on the
+/// pot worker thread, so this returns immediately; by the time a browser opens, the
+/// preset list is populated. Returns whether the unit could be loaded.
+pub fn warm_up() -> bool {
+    let Ok(shared) = standalone_pot_unit() else {
+        return false;
+    };
+    let mut unit = base::blocking_lock_arc(&shared, "pot warm_up");
+    unit.refresh_pot(shared.clone());
+    true
+}
+
+/// The global favorites store used by the standalone pot unit. Exposed so a UI layer
+/// (e.g. an egui browser hosted in the standalone extension) can implement its own
+/// `PotBrowserIntegration` against the same state the API uses.
+pub fn favorites() -> &'static RwLock<PotFavorites> {
+    LazyLock::force(&FAVORITES)
+}
+
+/// Reads the global filter exclude list used by the standalone pot unit.
+pub fn with_exclude_list<R>(f: impl FnOnce(&PotFilterExcludes) -> R) -> R {
+    let guard = EXCLUDE_LIST
+        .read()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    f(&guard)
+}
+
 struct StandalonePotIntegration {
     protected_fx: Fx,
 }

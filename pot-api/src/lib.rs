@@ -9,4 +9,4 @@ mod api;
 mod standalone_unit;
 
 pub use api::register_pot_api;
-pub use standalone_unit::standalone_pot_unit;
+pub use standalone_unit::{favorites, standalone_pot_unit, warm_up, with_exclude_list};
