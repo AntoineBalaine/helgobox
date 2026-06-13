@@ -69,6 +69,12 @@ struct PresetFields {
     product: String,
     file_ext: String,
     has_preview: bool,
+    /// Secondary context label (e.g. the project a project-preset came from). Empty if none.
+    context_name: String,
+    /// Filesystem path of the preset file, or empty for non-file-based presets.
+    path: String,
+    /// Filesystem path of the preview file, or empty if none exists.
+    preview_path: String,
 }
 
 thread_local! {
@@ -91,16 +97,27 @@ fn preset_fields_at(unit: &RuntimePotUnit, index: i32) -> Option<PresetFields> {
             .entry(preset_id)
             .or_insert_with(|| {
                 let preset: PotPreset = pot_db().try_find_preset_by_id(preset_id).ok()??;
+                let resource_path = Reaper::get().resource_path();
                 let file_ext = match &preset.kind {
                     PotPresetKind::FileBased(k) => k.file_ext.clone(),
                     _ => String::new(),
                 };
-                let has_preview = preview_exists(&preset, &Reaper::get().resource_path());
+                let path = match &preset.kind {
+                    PotPresetKind::FileBased(k) => k.path.to_string(),
+                    _ => String::new(),
+                };
+                let has_preview = preview_exists(&preset, &resource_path);
+                let preview_path = pot::find_preview_file(&preset, &resource_path)
+                    .map(|p| p.to_string())
+                    .unwrap_or_default();
                 Some(PresetFields {
                     name: preset.name().to_string(),
                     product: preset.common.product_name.clone().unwrap_or_default(),
                     file_ext,
                     has_preview,
+                    context_name: preset.common.context_name.clone().unwrap_or_default(),
+                    path,
+                    preview_path,
                 })
             })
             .clone()
@@ -511,6 +528,191 @@ unsafe extern "C" fn vararg_HB_Pot_GetSearchText(args: *mut *mut c_void, n: c_in
     ret_int(HB_Pot_GetSearchText(buf_arg(args, n, 0), int_arg(args, n, 1)))
 }
 
+extern "C" fn HB_Pot_GetPresetContextName(index: c_int, buf: *mut c_char, buf_sz: c_int) -> c_int {
+    with_pot_unit(|_, unit| {
+        let Some(f) = preset_fields_at(unit, index) else {
+            return 0;
+        };
+        unsafe { copy_to_buf(&f.context_name, buf, buf_sz) as c_int }
+    })
+    .unwrap_or(0)
+}
+unsafe extern "C" fn vararg_HB_Pot_GetPresetContextName(
+    args: *mut *mut c_void,
+    n: c_int,
+) -> *mut c_void {
+    ret_int(HB_Pot_GetPresetContextName(
+        int_arg(args, n, 0),
+        buf_arg(args, n, 1),
+        int_arg(args, n, 2),
+    ))
+}
+
+extern "C" fn HB_Pot_GetPresetPath(index: c_int, buf: *mut c_char, buf_sz: c_int) -> c_int {
+    with_pot_unit(|_, unit| {
+        let Some(f) = preset_fields_at(unit, index) else {
+            return 0;
+        };
+        unsafe { copy_to_buf(&f.path, buf, buf_sz) as c_int }
+    })
+    .unwrap_or(0)
+}
+unsafe extern "C" fn vararg_HB_Pot_GetPresetPath(args: *mut *mut c_void, n: c_int) -> *mut c_void {
+    ret_int(HB_Pot_GetPresetPath(
+        int_arg(args, n, 0),
+        buf_arg(args, n, 1),
+        int_arg(args, n, 2),
+    ))
+}
+
+extern "C" fn HB_Pot_GetPreviewPath(index: c_int, buf: *mut c_char, buf_sz: c_int) -> c_int {
+    with_pot_unit(|_, unit| {
+        let Some(f) = preset_fields_at(unit, index) else {
+            return 0;
+        };
+        unsafe { copy_to_buf(&f.preview_path, buf, buf_sz) as c_int }
+    })
+    .unwrap_or(0)
+}
+unsafe extern "C" fn vararg_HB_Pot_GetPreviewPath(args: *mut *mut c_void, n: c_int) -> *mut c_void {
+    ret_int(HB_Pot_GetPreviewPath(
+        int_arg(args, n, 0),
+        buf_arg(args, n, 1),
+        int_arg(args, n, 2),
+    ))
+}
+
+extern "C" fn HB_Pot_SupportsFilter(kind: *const c_char) -> c_int {
+    if kind.is_null() {
+        return 0;
+    }
+    let Some(kind) = parse_filter_kind(unsafe { CStr::from_ptr(kind) }) else {
+        return 0;
+    };
+    with_pot_unit(|_, unit| unit.supports_filter_kind(kind) as c_int).unwrap_or(0)
+}
+unsafe extern "C" fn vararg_HB_Pot_SupportsFilter(args: *mut *mut c_void, n: c_int) -> *mut c_void {
+    let kind = str_arg(args, n, 0).map(|s| s.as_ptr()).unwrap_or(std::ptr::null());
+    ret_int(HB_Pot_SupportsFilter(kind))
+}
+
+/// Search field index: 0 = preset name, 1 = product name, 2 = file extension.
+fn search_field_at(index: c_int) -> Option<pot::SearchField> {
+    use pot::SearchField::*;
+    match index {
+        0 => Some(PresetName),
+        1 => Some(ProductName),
+        2 => Some(FileExtension),
+        _ => None,
+    }
+}
+
+extern "C" fn HB_Pot_GetSearchField(index: c_int) -> c_int {
+    let Some(field) = search_field_at(index) else {
+        return 0;
+    };
+    with_pot_unit(|_, unit| {
+        unit.runtime_state
+            .search_options
+            .search_fields
+            .contains(field) as c_int
+    })
+    .unwrap_or(0)
+}
+unsafe extern "C" fn vararg_HB_Pot_GetSearchField(args: *mut *mut c_void, n: c_int) -> *mut c_void {
+    ret_int(HB_Pot_GetSearchField(int_arg(args, n, 0)))
+}
+
+extern "C" fn HB_Pot_SetSearchField(index: c_int, on: c_int) {
+    let Some(field) = search_field_at(index) else {
+        return;
+    };
+    with_pot_unit(|shared, unit| {
+        if on != 0 {
+            unit.runtime_state.search_options.search_fields.insert(field);
+        } else {
+            unit.runtime_state.search_options.search_fields.remove(field);
+        }
+        unit.rebuild_collections(shared.clone(), ChangeHint::SearchExpression, Debounce::No);
+    });
+}
+unsafe extern "C" fn vararg_HB_Pot_SetSearchField(args: *mut *mut c_void, n: c_int) -> *mut c_void {
+    HB_Pot_SetSearchField(int_arg(args, n, 0), int_arg(args, n, 1));
+    std::ptr::null_mut()
+}
+
+extern "C" fn HB_Pot_GetUseWildcards() -> c_int {
+    with_pot_unit(|_, unit| unit.runtime_state.search_options.use_wildcards as c_int).unwrap_or(0)
+}
+unsafe extern "C" fn vararg_HB_Pot_GetUseWildcards(_: *mut *mut c_void, _: c_int) -> *mut c_void {
+    ret_int(HB_Pot_GetUseWildcards())
+}
+
+extern "C" fn HB_Pot_SetUseWildcards(on: c_int) {
+    with_pot_unit(|shared, unit| {
+        unit.runtime_state.search_options.use_wildcards = on != 0;
+        unit.rebuild_collections(shared.clone(), ChangeHint::SearchExpression, Debounce::No);
+    });
+}
+unsafe extern "C" fn vararg_HB_Pot_SetUseWildcards(args: *mut *mut c_void, n: c_int) -> *mut c_void {
+    HB_Pot_SetUseWildcards(int_arg(args, n, 0));
+    std::ptr::null_mut()
+}
+
+extern "C" fn HB_Pot_IsFilterItemExcluded(kind: *const c_char, index: c_int) -> c_int {
+    if kind.is_null() {
+        return 0;
+    }
+    let Some(kind) = parse_filter_kind(unsafe { CStr::from_ptr(kind) }) else {
+        return 0;
+    };
+    with_pot_unit(|_, unit| {
+        let Some(item) = usize::try_from(index)
+            .ok()
+            .and_then(|i| unit.filter_item_collections.get(kind).get(i))
+        else {
+            return 0;
+        };
+        let id = item.id;
+        crate::standalone_unit::with_exclude_list(|excludes| excludes.contains(kind, id) as c_int)
+    })
+    .unwrap_or(0)
+}
+unsafe extern "C" fn vararg_HB_Pot_IsFilterItemExcluded(
+    args: *mut *mut c_void,
+    n: c_int,
+) -> *mut c_void {
+    let kind = str_arg(args, n, 0).map(|s| s.as_ptr()).unwrap_or(std::ptr::null());
+    ret_int(HB_Pot_IsFilterItemExcluded(kind, int_arg(args, n, 1)))
+}
+
+extern "C" fn HB_Pot_SetFilterItemExcluded(kind: *const c_char, index: c_int, excluded: c_int) {
+    if kind.is_null() {
+        return;
+    }
+    let Some(kind) = parse_filter_kind(unsafe { CStr::from_ptr(kind) }) else {
+        return;
+    };
+    with_pot_unit(|shared, unit| {
+        if let Some(item) = usize::try_from(index)
+            .ok()
+            .and_then(|i| unit.filter_item_collections.get(kind).get(i))
+        {
+            let id = item.id;
+            // include = !excluded
+            unit.include_filter_item(kind, id, excluded == 0, shared.clone());
+        }
+    });
+}
+unsafe extern "C" fn vararg_HB_Pot_SetFilterItemExcluded(
+    args: *mut *mut c_void,
+    n: c_int,
+) -> *mut c_void {
+    let kind = str_arg(args, n, 0).map(|s| s.as_ptr()).unwrap_or(std::ptr::null());
+    HB_Pot_SetFilterItemExcluded(kind, int_arg(args, n, 1), int_arg(args, n, 2));
+    std::ptr::null_mut()
+}
+
 // ============================================================================
 // Registration
 // ============================================================================
@@ -564,6 +766,16 @@ macro_rules! paste_vararg {
     (HB_Pot_GetFilter) => { vararg_HB_Pot_GetFilter };
     (HB_Pot_SetSearchText) => { vararg_HB_Pot_SetSearchText };
     (HB_Pot_GetSearchText) => { vararg_HB_Pot_GetSearchText };
+    (HB_Pot_GetPresetContextName) => { vararg_HB_Pot_GetPresetContextName };
+    (HB_Pot_GetPresetPath) => { vararg_HB_Pot_GetPresetPath };
+    (HB_Pot_GetPreviewPath) => { vararg_HB_Pot_GetPreviewPath };
+    (HB_Pot_SupportsFilter) => { vararg_HB_Pot_SupportsFilter };
+    (HB_Pot_GetSearchField) => { vararg_HB_Pot_GetSearchField };
+    (HB_Pot_SetSearchField) => { vararg_HB_Pot_SetSearchField };
+    (HB_Pot_GetUseWildcards) => { vararg_HB_Pot_GetUseWildcards };
+    (HB_Pot_SetUseWildcards) => { vararg_HB_Pot_SetUseWildcards };
+    (HB_Pot_IsFilterItemExcluded) => { vararg_HB_Pot_IsFilterItemExcluded };
+    (HB_Pot_SetFilterItemExcluded) => { vararg_HB_Pot_SetFilterItemExcluded };
 }
 
 fn pot_api_fns() -> Vec<PotApiFn> {
@@ -612,6 +824,26 @@ fn pot_api_fns() -> Vec<PotApiFn> {
             b"void\0const char*\0text\0Sets the search expression and rebuilds the preset list (debounced).\0";
         HB_Pot_GetSearchText:
             b"int\0char*,int\0textOut,textOut_sz\0Gets the current search expression.\0";
+        HB_Pot_GetPresetContextName:
+            b"int\0int,char*,int\0index,nameOut,nameOut_sz\0Gets the secondary context label of the preset at the given index (e.g. the source project), empty if none. Returns 0 on failure.\0";
+        HB_Pot_GetPresetPath:
+            b"int\0int,char*,int\0index,pathOut,pathOut_sz\0Gets the filesystem path of the preset file at the given index (empty for non-file-based presets). Returns 0 on failure.\0";
+        HB_Pot_GetPreviewPath:
+            b"int\0int,char*,int\0index,pathOut,pathOut_sz\0Gets the filesystem path of the preset's preview file at the given index (empty if none). Returns 0 on failure.\0";
+        HB_Pot_SupportsFilter:
+            b"int\0const char*\0kind\0Returns 1 if the given filter kind is relevant for the current results (use this to show/hide sub-filters).\0";
+        HB_Pot_GetSearchField:
+            b"int\0int\0field\0Returns 1 if the given search field is enabled. field: 0=preset name, 1=product, 2=extension.\0";
+        HB_Pot_SetSearchField:
+            b"void\0int,int\0field,on\0Enables or disables a search field (0=preset name, 1=product, 2=extension) and rebuilds the list.\0";
+        HB_Pot_GetUseWildcards:
+            b"int\0\0\0Returns 1 if wildcard search is enabled.\0";
+        HB_Pot_SetUseWildcards:
+            b"void\0int\0on\0Enables or disables wildcard search and rebuilds the list.\0";
+        HB_Pot_IsFilterItemExcluded:
+            b"int\0const char*,int\0kind,index\0Returns 1 if the filter item at the given index of the given kind is globally excluded.\0";
+        HB_Pot_SetFilterItemExcluded:
+            b"void\0const char*,int,int\0kind,index,excluded\0Globally excludes (excluded=1) or re-includes (excluded=0) the given filter item.\0";
     ]
 }
 
