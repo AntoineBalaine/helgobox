@@ -4908,6 +4908,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "pot-api"
+version = "0.1.0"
+dependencies = [
+ "base",
+ "helgobox-api",
+ "pot",
+ "reaper-high",
+ "reaper-low",
+ "reaper-medium",
+ "swell-ui",
+]
+
+[[package]]
 name = "pot-browser"
 version = "0.1.0"
 dependencies = [
@@ -4932,6 +4945,18 @@ dependencies = [
  "strum",
  "swell-ui",
  "url",
+]
+
+[[package]]
+name = "pot-extension"
+version = "0.1.0"
+dependencies = [
+ "pot",
+ "pot-api",
+ "reaper-high",
+ "reaper-low",
+ "reaper-macros",
+ "reaper-medium",
 ]
 
 [[package]]

@@ -9,6 +9,8 @@ members = [
     "playtime-clip-engine-placeholder",
     "playtime-api",
     "pot",
+    "pot-api",
+    "pot-extension",
     "pot-browser",
     "csi",
     "main",
@@ -24,6 +26,7 @@ members = [
 # Own
 base = { path = "base" }
 pot = { path = "pot" }
+pot-api = { path = "pot-api" }
 pot-browser = { path = "pot-browser" }
 helgobox-dialogs = { path = "dialogs" }
 reaper-common-types = { git = "https://github.com/helgoboss/reaper-rs.git", branch = "master" }

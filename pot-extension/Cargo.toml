@@ -1,0 +1,25 @@
+[package]
+name = "pot-extension"
+version = "0.1.0"
+authors = ["Benjamin Klum <benjamin.klum@helgoboss.org>"]
+edition = "2021"
+publish = false
+
+# A standalone REAPER extension exposing only the Pot preset browser engine and its
+# HB_Pot_* ReaScript API — none of ReaLearn. Builds a much smaller artifact than the
+# full Helgobox plugin, which is what you want when iterating on a script-based pot
+# browser (e.g. the Lua/ReaImGui UI).
+[lib]
+name = "reaper_pot"
+crate-type = ["cdylib"]
+
+[dependencies]
+pot-api.workspace = true
+pot.workspace = true
+reaper-high.workspace = true
+reaper-medium.workspace = true
+reaper-low.workspace = true
+reaper-macros.workspace = true
+
+[lints.clippy]
+enum_glob_use = "deny"
