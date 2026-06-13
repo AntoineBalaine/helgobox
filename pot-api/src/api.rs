@@ -673,15 +673,27 @@ unsafe extern "C" fn vararg_HB_Pot_IsPresetFavorite(args: *mut *mut c_void, n: c
 }
 
 extern "C" fn HB_Pot_TogglePresetFavorite(index: c_int) {
-    with_pot_unit(|_, unit| {
-        if let Some(id) = u32::try_from(index)
+    with_pot_unit(|shared, unit| {
+        let Some(id) = u32::try_from(index)
             .ok()
             .and_then(|i| unit.find_preset_id_at_index(i))
+        else {
+            return;
+        };
         {
             let mut favs = crate::standalone_unit::favorites()
                 .write()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             favs.toggle_favorite(id);
+        }
+        // If the list is filtered by favorites, its membership just changed, so rebuild
+        // it (collections only — no database re-scan).
+        if unit.get_filter(PotFilterKind::IsFavorite).is_some() {
+            unit.rebuild_collections(
+                shared.clone(),
+                ChangeHint::Filter(PotFilterKind::IsFavorite),
+                Debounce::No,
+            );
         }
     });
 }

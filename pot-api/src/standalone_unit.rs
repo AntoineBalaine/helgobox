@@ -53,6 +53,13 @@ pub fn with_current_preset<R>(fx: &Fx, f: impl FnOnce(Option<&CurrentPreset>) ->
 /// Must be called from the main thread.
 pub fn standalone_pot_unit() -> Result<SharedRuntimePotUnit, &'static str> {
     STANDALONE_POT_UNIT.with(|unit| {
+        // Fast path: already loaded. Return the existing unit WITHOUT constructing a new
+        // integration. Building one calls master_track() — that would run on every single
+        // API call (wasteful), and a transient failure there must never make an
+        // already-loaded unit report itself unavailable.
+        if let PotUnit::Loaded(shared) = &*unit.borrow() {
+            return Ok(shared.clone());
+        }
         unit.borrow_mut()
             .loaded(Box::new(StandalonePotIntegration::new()?))
     })

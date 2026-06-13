@@ -624,9 +624,14 @@ local function frame()
 end
 
 local function loop()
+  -- The extension scans the databases at REAPER startup. Only trigger a scan ourselves
+  -- if, by the time the window first opens, the engine is neither already scanning nor
+  -- populated (i.e. the startup warm-up didn't run) - this avoids a redundant rescan.
   if not refreshed_once and r.HB_Pot_IsAvailable() ~= 0 then
+    if r.HB_Pot_IsBusy() == 0 and r.HB_Pot_GetPresetCount() <= 0 then
+      r.HB_Pot_Refresh()
+    end
     refreshed_once = true
-    r.HB_Pot_Refresh()
   end
   r.ImGui_SetNextWindowSize(ctx, 820, 560, r.ImGui_Cond_FirstUseEver())
   local visible, open = r.ImGui_Begin(ctx, 'Pot Browser (Lua)', true)
