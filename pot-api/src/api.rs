@@ -692,6 +692,245 @@ unsafe extern "C" fn vararg_HB_Pot_TogglePresetFavorite(
     std::ptr::null_mut()
 }
 
+// ---------------------------------------------------------------------------
+// Destination panel
+// ---------------------------------------------------------------------------
+//
+// Destination track is encoded as a single int: -2 = selected track, -1 = master track,
+// >= 0 = specific track index.
+
+use pot::DestinationTrackDescriptor as Dtd;
+
+extern "C" fn HB_Pot_GetDestinationTrack() -> c_int {
+    with_pot_unit(|_, unit| match unit.destination_descriptor.track {
+        Dtd::SelectedTrack => -2,
+        Dtd::MasterTrack => -1,
+        Dtd::Track(i) => i as c_int,
+    })
+    .unwrap_or(-2)
+}
+unsafe extern "C" fn vararg_HB_Pot_GetDestinationTrack(_: *mut *mut c_void, _: c_int) -> *mut c_void {
+    ret_int(HB_Pot_GetDestinationTrack())
+}
+
+extern "C" fn HB_Pot_SetDestinationTrack(value: c_int) {
+    with_pot_unit(|_, unit| {
+        unit.destination_descriptor.track = match value {
+            -2 => Dtd::SelectedTrack,
+            -1 => Dtd::MasterTrack,
+            i if i >= 0 => Dtd::Track(i as u32),
+            _ => Dtd::SelectedTrack,
+        };
+    });
+}
+unsafe extern "C" fn vararg_HB_Pot_SetDestinationTrack(args: *mut *mut c_void, n: c_int) -> *mut c_void {
+    HB_Pot_SetDestinationTrack(int_arg(args, n, 0));
+    std::ptr::null_mut()
+}
+
+extern "C" fn HB_Pot_GetDestinationFxIndex() -> c_int {
+    with_pot_unit(|_, unit| unit.destination_descriptor.fx_index as c_int).unwrap_or(0)
+}
+unsafe extern "C" fn vararg_HB_Pot_GetDestinationFxIndex(_: *mut *mut c_void, _: c_int) -> *mut c_void {
+    ret_int(HB_Pot_GetDestinationFxIndex())
+}
+
+extern "C" fn HB_Pot_SetDestinationFxIndex(index: c_int) {
+    with_pot_unit(|_, unit| {
+        if index >= 0 {
+            unit.destination_descriptor.fx_index = index as u32;
+        }
+    });
+}
+unsafe extern "C" fn vararg_HB_Pot_SetDestinationFxIndex(args: *mut *mut c_void, n: c_int) -> *mut c_void {
+    HB_Pot_SetDestinationFxIndex(int_arg(args, n, 0));
+    std::ptr::null_mut()
+}
+
+extern "C" fn HB_Pot_GetTrackCount() -> c_int {
+    reaper_low::firewall(|| Reaper::get().current_project().track_count() as c_int).unwrap_or(0)
+}
+unsafe extern "C" fn vararg_HB_Pot_GetTrackCount(_: *mut *mut c_void, _: c_int) -> *mut c_void {
+    ret_int(HB_Pot_GetTrackCount())
+}
+
+extern "C" fn HB_Pot_GetTrackName(index: c_int, buf: *mut c_char, buf_sz: c_int) -> c_int {
+    reaper_low::firewall(|| {
+        let Some(i) = u32::try_from(index).ok() else {
+            return 0;
+        };
+        let Some(track) = Reaper::get().current_project().track_by_index(i) else {
+            return 0;
+        };
+        let name = track
+            .name()
+            .map(|n| n.into_string())
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| format!("Track {}", i + 1));
+        unsafe { copy_to_buf(&format!("{}. {}", i + 1, name), buf, buf_sz) as c_int }
+    })
+    .unwrap_or(0)
+}
+unsafe extern "C" fn vararg_HB_Pot_GetTrackName(args: *mut *mut c_void, n: c_int) -> *mut c_void {
+    ret_int(HB_Pot_GetTrackName(
+        int_arg(args, n, 0),
+        buf_arg(args, n, 1),
+        int_arg(args, n, 2),
+    ))
+}
+
+/// Number of FX in the resolved destination track's chain (0 if it can't be resolved).
+extern "C" fn HB_Pot_GetDestinationFxCount() -> c_int {
+    with_pot_unit(|_, unit| {
+        unit.destination_descriptor
+            .track
+            .resolve(Reaper::get().current_project())
+            .map(|t| t.normal_fx_chain().fx_count() as c_int)
+            .unwrap_or(0)
+    })
+    .unwrap_or(0)
+}
+unsafe extern "C" fn vararg_HB_Pot_GetDestinationFxCount(_: *mut *mut c_void, _: c_int) -> *mut c_void {
+    ret_int(HB_Pot_GetDestinationFxCount())
+}
+
+extern "C" fn HB_Pot_GetDestinationFxName(index: c_int, buf: *mut c_char, buf_sz: c_int) -> c_int {
+    with_pot_unit(|_, unit| {
+        let Ok(track) = unit
+            .destination_descriptor
+            .track
+            .resolve(Reaper::get().current_project())
+        else {
+            return 0;
+        };
+        let Some(i) = u32::try_from(index).ok() else {
+            return 0;
+        };
+        let Some(fx) = track.normal_fx_chain().fx_by_index(i) else {
+            return 0;
+        };
+        unsafe { copy_to_buf(&fx.name().into_string(), buf, buf_sz) as c_int }
+    })
+    .unwrap_or(0)
+}
+unsafe extern "C" fn vararg_HB_Pot_GetDestinationFxName(args: *mut *mut c_void, n: c_int) -> *mut c_void {
+    ret_int(HB_Pot_GetDestinationFxName(
+        int_arg(args, n, 0),
+        buf_arg(args, n, 1),
+        int_arg(args, n, 2),
+    ))
+}
+
+fn with_destination_fx(unit: &RuntimePotUnit, f: impl FnOnce(&reaper_high::Fx)) {
+    if let Some(fx) = unit
+        .resolve_destination()
+        .ok()
+        .and_then(|inst| inst.get_existing().and_then(|dest| dest.resolve()))
+    {
+        f(&fx);
+    }
+}
+
+extern "C" fn HB_Pot_ShowDestinationFx() {
+    with_pot_unit(|_, unit| {
+        with_destination_fx(unit, |fx| {
+            let _ = fx.show_in_floating_window();
+        })
+    });
+}
+unsafe extern "C" fn vararg_HB_Pot_ShowDestinationFx(_: *mut *mut c_void, _: c_int) -> *mut c_void {
+    HB_Pot_ShowDestinationFx();
+    std::ptr::null_mut()
+}
+
+extern "C" fn HB_Pot_ShowDestinationChain() {
+    with_pot_unit(|_, unit| {
+        with_destination_fx(unit, |fx| {
+            let _ = fx.show_in_chain();
+        })
+    });
+}
+unsafe extern "C" fn vararg_HB_Pot_ShowDestinationChain(_: *mut *mut c_void, _: c_int) -> *mut c_void {
+    HB_Pot_ShowDestinationChain();
+    std::ptr::null_mut()
+}
+
+// ---------------------------------------------------------------------------
+// Load options
+// ---------------------------------------------------------------------------
+
+extern "C" fn HB_Pot_GetLoadWindowBehaviorCount() -> c_int {
+    use strum::IntoEnumIterator;
+    pot::LoadPresetWindowBehavior::iter().count() as c_int
+}
+unsafe extern "C" fn vararg_HB_Pot_GetLoadWindowBehaviorCount(_: *mut *mut c_void, _: c_int) -> *mut c_void {
+    ret_int(HB_Pot_GetLoadWindowBehaviorCount())
+}
+
+extern "C" fn HB_Pot_GetLoadWindowBehaviorName(index: c_int, buf: *mut c_char, buf_sz: c_int) -> c_int {
+    use strum::IntoEnumIterator;
+    let Some(b) = usize::try_from(index)
+        .ok()
+        .and_then(|i| pot::LoadPresetWindowBehavior::iter().nth(i))
+    else {
+        return 0;
+    };
+    unsafe { copy_to_buf(b.as_ref(), buf, buf_sz) as c_int }
+}
+unsafe extern "C" fn vararg_HB_Pot_GetLoadWindowBehaviorName(args: *mut *mut c_void, n: c_int) -> *mut c_void {
+    ret_int(HB_Pot_GetLoadWindowBehaviorName(
+        int_arg(args, n, 0),
+        buf_arg(args, n, 1),
+        int_arg(args, n, 2),
+    ))
+}
+
+extern "C" fn HB_Pot_GetLoadWindowBehavior() -> c_int {
+    use strum::IntoEnumIterator;
+    with_pot_unit(|_, unit| {
+        let current = unit.default_load_preset_window_behavior;
+        pot::LoadPresetWindowBehavior::iter()
+            .position(|b| b == current)
+            .map(|i| i as c_int)
+            .unwrap_or(0)
+    })
+    .unwrap_or(0)
+}
+unsafe extern "C" fn vararg_HB_Pot_GetLoadWindowBehavior(_: *mut *mut c_void, _: c_int) -> *mut c_void {
+    ret_int(HB_Pot_GetLoadWindowBehavior())
+}
+
+extern "C" fn HB_Pot_SetLoadWindowBehavior(index: c_int) {
+    use strum::IntoEnumIterator;
+    with_pot_unit(|_, unit| {
+        if let Some(b) = usize::try_from(index)
+            .ok()
+            .and_then(|i| pot::LoadPresetWindowBehavior::iter().nth(i))
+        {
+            unit.default_load_preset_window_behavior = b;
+        }
+    });
+}
+unsafe extern "C" fn vararg_HB_Pot_SetLoadWindowBehavior(args: *mut *mut c_void, n: c_int) -> *mut c_void {
+    HB_Pot_SetLoadWindowBehavior(int_arg(args, n, 0));
+    std::ptr::null_mut()
+}
+
+extern "C" fn HB_Pot_GetNameTrackAfterPreset() -> c_int {
+    with_pot_unit(|_, unit| unit.name_track_after_preset as c_int).unwrap_or(0)
+}
+unsafe extern "C" fn vararg_HB_Pot_GetNameTrackAfterPreset(_: *mut *mut c_void, _: c_int) -> *mut c_void {
+    ret_int(HB_Pot_GetNameTrackAfterPreset())
+}
+
+extern "C" fn HB_Pot_SetNameTrackAfterPreset(on: c_int) {
+    with_pot_unit(|_, unit| unit.name_track_after_preset = on != 0);
+}
+unsafe extern "C" fn vararg_HB_Pot_SetNameTrackAfterPreset(args: *mut *mut c_void, n: c_int) -> *mut c_void {
+    HB_Pot_SetNameTrackAfterPreset(int_arg(args, n, 0));
+    std::ptr::null_mut()
+}
+
 extern "C" fn HB_Pot_SupportsFilter(kind: *const c_char) -> c_int {
     if kind.is_null() {
         return 0;
@@ -889,6 +1128,22 @@ macro_rules! paste_vararg {
     (HB_Pot_GetPresetMetadata) => { vararg_HB_Pot_GetPresetMetadata };
     (HB_Pot_IsPresetFavorite) => { vararg_HB_Pot_IsPresetFavorite };
     (HB_Pot_TogglePresetFavorite) => { vararg_HB_Pot_TogglePresetFavorite };
+    (HB_Pot_GetDestinationTrack) => { vararg_HB_Pot_GetDestinationTrack };
+    (HB_Pot_SetDestinationTrack) => { vararg_HB_Pot_SetDestinationTrack };
+    (HB_Pot_GetDestinationFxIndex) => { vararg_HB_Pot_GetDestinationFxIndex };
+    (HB_Pot_SetDestinationFxIndex) => { vararg_HB_Pot_SetDestinationFxIndex };
+    (HB_Pot_GetTrackCount) => { vararg_HB_Pot_GetTrackCount };
+    (HB_Pot_GetTrackName) => { vararg_HB_Pot_GetTrackName };
+    (HB_Pot_GetDestinationFxCount) => { vararg_HB_Pot_GetDestinationFxCount };
+    (HB_Pot_GetDestinationFxName) => { vararg_HB_Pot_GetDestinationFxName };
+    (HB_Pot_ShowDestinationFx) => { vararg_HB_Pot_ShowDestinationFx };
+    (HB_Pot_ShowDestinationChain) => { vararg_HB_Pot_ShowDestinationChain };
+    (HB_Pot_GetLoadWindowBehaviorCount) => { vararg_HB_Pot_GetLoadWindowBehaviorCount };
+    (HB_Pot_GetLoadWindowBehaviorName) => { vararg_HB_Pot_GetLoadWindowBehaviorName };
+    (HB_Pot_GetLoadWindowBehavior) => { vararg_HB_Pot_GetLoadWindowBehavior };
+    (HB_Pot_SetLoadWindowBehavior) => { vararg_HB_Pot_SetLoadWindowBehavior };
+    (HB_Pot_GetNameTrackAfterPreset) => { vararg_HB_Pot_GetNameTrackAfterPreset };
+    (HB_Pot_SetNameTrackAfterPreset) => { vararg_HB_Pot_SetNameTrackAfterPreset };
 }
 
 fn pot_api_fns() -> Vec<PotApiFn> {
@@ -963,6 +1218,38 @@ fn pot_api_fns() -> Vec<PotApiFn> {
             b"int\0int\0index\0Returns 1 if the preset at the given index is marked as a favorite.\0";
         HB_Pot_TogglePresetFavorite:
             b"void\0int\0index\0Toggles the favorite mark of the preset at the given index.\0";
+        HB_Pot_GetDestinationTrack:
+            b"int\0\0\0Returns the destination track: -2 = selected track, -1 = master track, >=0 = specific track index.\0";
+        HB_Pot_SetDestinationTrack:
+            b"void\0int\0value\0Sets the destination track (-2 = selected, -1 = master, >=0 = specific track index).\0";
+        HB_Pot_GetDestinationFxIndex:
+            b"int\0\0\0Returns the destination FX slot index in the destination track's chain.\0";
+        HB_Pot_SetDestinationFxIndex:
+            b"void\0int\0index\0Sets the destination FX slot index.\0";
+        HB_Pot_GetTrackCount:
+            b"int\0\0\0Returns the number of tracks in the current project.\0";
+        HB_Pot_GetTrackName:
+            b"int\0int,char*,int\0index,nameOut,nameOut_sz\0Gets a display label for the track at the given index. Returns 0 on failure.\0";
+        HB_Pot_GetDestinationFxCount:
+            b"int\0\0\0Returns the number of FX in the resolved destination track's chain (0 if unresolved).\0";
+        HB_Pot_GetDestinationFxName:
+            b"int\0int,char*,int\0index,nameOut,nameOut_sz\0Gets the name of the FX at the given index in the destination chain. Returns 0 on failure.\0";
+        HB_Pot_ShowDestinationFx:
+            b"void\0\0\0Shows the currently targeted destination FX in a floating window.\0";
+        HB_Pot_ShowDestinationChain:
+            b"void\0\0\0Shows the destination track's FX chain.\0";
+        HB_Pot_GetLoadWindowBehaviorCount:
+            b"int\0\0\0Returns the number of available FX-window-behavior options for preset loading.\0";
+        HB_Pot_GetLoadWindowBehaviorName:
+            b"int\0int,char*,int\0index,nameOut,nameOut_sz\0Gets the name of the FX-window-behavior option at the given index.\0";
+        HB_Pot_GetLoadWindowBehavior:
+            b"int\0\0\0Returns the index of the current FX-window-behavior option.\0";
+        HB_Pot_SetLoadWindowBehavior:
+            b"void\0int\0index\0Sets the FX-window-behavior option used when loading presets.\0";
+        HB_Pot_GetNameTrackAfterPreset:
+            b"int\0\0\0Returns 1 if the destination track is renamed after the loaded preset.\0";
+        HB_Pot_SetNameTrackAfterPreset:
+            b"void\0int\0on\0Enables or disables renaming the destination track after the loaded preset.\0";
     ]
 }
 

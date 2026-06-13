@@ -400,9 +400,9 @@ local function preset_table()
   end
 end
 
-local function search_options_popup()
-  if r.ImGui_Button(ctx, 'Options') then r.ImGui_OpenPopup(ctx, 'search_options') end
-  if r.ImGui_BeginPopup(ctx, 'search_options') then
+local function options_popup()
+  if r.ImGui_Button(ctx, 'Options') then r.ImGui_OpenPopup(ctx, 'options') end
+  if r.ImGui_BeginPopup(ctx, 'options') then
     r.ImGui_Text(ctx, 'Search fields')
     for idx, label in ipairs(SEARCH_FIELDS) do
       local field = idx - 1
@@ -410,12 +410,80 @@ local function search_options_popup()
       local changed, new_on = r.ImGui_Checkbox(ctx, label, on)
       if changed then r.HB_Pot_SetSearchField(field, new_on and 1 or 0) end
     end
-    r.ImGui_Separator(ctx)
     local wc = r.HB_Pot_GetUseWildcards() ~= 0
     local wc_changed, new_wc = r.ImGui_Checkbox(ctx, 'Wildcards (* and ?)', wc)
     if wc_changed then r.HB_Pot_SetUseWildcards(new_wc and 1 or 0) end
+    r.ImGui_Separator(ctx)
+    r.ImGui_Text(ctx, 'Load options')
+    -- FX window behavior
+    local wb = r.HB_Pot_GetLoadWindowBehavior()
+    local _, wb_name = r.HB_Pot_GetLoadWindowBehaviorName(wb)
+    r.ImGui_SetNextItemWidth(ctx, 280)
+    if r.ImGui_BeginCombo(ctx, 'FX window', wb_name or '') then
+      for i = 0, r.HB_Pot_GetLoadWindowBehaviorCount() - 1 do
+        local _, n = r.HB_Pot_GetLoadWindowBehaviorName(i)
+        if r.ImGui_Selectable(ctx, (n or tostring(i)) .. '##wb' .. i, i == wb) then
+          r.HB_Pot_SetLoadWindowBehavior(i)
+        end
+      end
+      r.ImGui_EndCombo(ctx)
+    end
+    local nt = r.HB_Pot_GetNameTrackAfterPreset() ~= 0
+    local nt_changed, new_nt = r.ImGui_Checkbox(ctx, 'Name track after preset', nt)
+    if nt_changed then r.HB_Pot_SetNameTrackAfterPreset(new_nt and 1 or 0) end
     r.ImGui_EndPopup(ctx)
   end
+end
+
+-- "Load into <track> at <fx>" plus show-chain / show-fx buttons.
+local function destination_panel()
+  local function track_label(code)
+    if code == -2 then return '<Selected track>' end
+    if code == -1 then return '<Master track>' end
+    local ok, name = r.HB_Pot_GetTrackName(code)
+    return (ok ~= 0 and name) or ('Track ' .. (code + 1))
+  end
+  r.ImGui_AlignTextToFramePadding(ctx)
+  r.ImGui_Text(ctx, 'Load into')
+  r.ImGui_SameLine(ctx)
+  local cur = r.HB_Pot_GetDestinationTrack()
+  r.ImGui_SetNextItemWidth(ctx, 180)
+  if r.ImGui_BeginCombo(ctx, '##desttrack', track_label(cur)) then
+    if r.ImGui_Selectable(ctx, '<Selected track>', cur == -2) then r.HB_Pot_SetDestinationTrack(-2) end
+    if r.ImGui_Selectable(ctx, '<Master track>', cur == -1) then r.HB_Pot_SetDestinationTrack(-1) end
+    for i = 0, r.HB_Pot_GetTrackCount() - 1 do
+      if r.ImGui_Selectable(ctx, track_label(i) .. '##t' .. i, cur == i) then
+        r.HB_Pot_SetDestinationTrack(i)
+      end
+    end
+    r.ImGui_EndCombo(ctx)
+  end
+
+  r.ImGui_SameLine(ctx)
+  r.ImGui_Text(ctx, 'at')
+  r.ImGui_SameLine(ctx)
+  local fx_count = r.HB_Pot_GetDestinationFxCount()
+  local fx_idx = r.HB_Pot_GetDestinationFxIndex()
+  local function fx_label(idx)
+    if idx >= fx_count then return '<New FX>' end
+    local ok, name = r.HB_Pot_GetDestinationFxName(idx)
+    return (ok ~= 0 and ((idx + 1) .. '. ' .. name)) or ('FX ' .. (idx + 1))
+  end
+  r.ImGui_SetNextItemWidth(ctx, 160)
+  if r.ImGui_BeginCombo(ctx, '##destfx', fx_label(fx_idx)) then
+    for i = 0, fx_count do
+      local label = (i < fx_count) and fx_label(i) or '<New FX>'
+      if r.ImGui_Selectable(ctx, label .. '##fx' .. i, i == fx_idx) then
+        r.HB_Pot_SetDestinationFxIndex(i)
+      end
+    end
+    r.ImGui_EndCombo(ctx)
+  end
+
+  r.ImGui_SameLine(ctx)
+  if r.ImGui_SmallButton(ctx, 'Chain') then r.HB_Pot_ShowDestinationChain() end
+  r.ImGui_SameLine(ctx)
+  if r.ImGui_SmallButton(ctx, 'FX') then r.HB_Pot_ShowDestinationFx() end
 end
 
 local function toolbar()
@@ -442,7 +510,7 @@ local function toolbar()
     r.HB_Pot_SetSearchText(new_text)
   end
   r.ImGui_SameLine(ctx)
-  search_options_popup()
+  options_popup()
 
   -- Preview volume + mute
   r.ImGui_SameLine(ctx)
@@ -477,6 +545,7 @@ end
 
 local function frame()
   toolbar()
+  destination_panel()
   -- Hierarchical filters (gated ones only when relevant + non-empty)
   local shown = 0
   for _, kind in ipairs(FILTER_KINDS) do
