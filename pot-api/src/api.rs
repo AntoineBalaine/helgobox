@@ -75,6 +75,25 @@ struct PresetFields {
     path: String,
     /// Filesystem path of the preview file, or empty if none exists.
     preview_path: String,
+    /// Name of the database this preset belongs to.
+    database: String,
+    vendor: String,
+    author: String,
+    comment: String,
+    /// Modification date, formatted, or empty.
+    date: String,
+    /// Human-readable file size, or empty.
+    file_size: String,
+}
+
+fn human_size(bytes: u64) -> String {
+    if bytes >= 1 << 20 {
+        format!("{:.1} MB", bytes as f64 / 1_048_576.0)
+    } else if bytes >= 1 << 10 {
+        format!("{:.1} KB", bytes as f64 / 1024.0)
+    } else {
+        format!("{bytes} B")
+    }
 }
 
 thread_local! {
@@ -110,6 +129,10 @@ fn preset_fields_at(unit: &RuntimePotUnit, index: i32) -> Option<PresetFields> {
                 let preview_path = pot::find_preview_file(&preset, &resource_path)
                     .map(|p| p.to_string())
                     .unwrap_or_default();
+                let database = pot_db()
+                    .try_with_db(preset_id.database_id, |db| db.name().to_string())
+                    .unwrap_or_default();
+                let m = &preset.common.metadata;
                 Some(PresetFields {
                     name: preset.name().to_string(),
                     product: preset.common.product_name.clone().unwrap_or_default(),
@@ -118,6 +141,12 @@ fn preset_fields_at(unit: &RuntimePotUnit, index: i32) -> Option<PresetFields> {
                     context_name: preset.common.context_name.clone().unwrap_or_default(),
                     path,
                     preview_path,
+                    database,
+                    vendor: m.vendor.clone().unwrap_or_default(),
+                    author: m.author.clone().unwrap_or_default(),
+                    comment: m.comment.clone().unwrap_or_default(),
+                    date: m.modification_date.map(|d| d.to_string()).unwrap_or_default(),
+                    file_size: m.file_size_in_bytes.map(human_size).unwrap_or_default(),
                 })
             })
             .clone()
@@ -582,6 +611,87 @@ unsafe extern "C" fn vararg_HB_Pot_GetPreviewPath(args: *mut *mut c_void, n: c_i
     ))
 }
 
+extern "C" fn HB_Pot_GetPresetMetadata(
+    index: c_int,
+    field: *const c_char,
+    buf: *mut c_char,
+    buf_sz: c_int,
+) -> c_int {
+    if field.is_null() {
+        return 0;
+    }
+    let field = unsafe { CStr::from_ptr(field) };
+    with_pot_unit(|_, unit| {
+        let Some(f) = preset_fields_at(unit, index) else {
+            return 0;
+        };
+        let value = match field.to_str().unwrap_or("") {
+            "vendor" => &f.vendor,
+            "author" => &f.author,
+            "comment" => &f.comment,
+            "date" => &f.date,
+            "database" => &f.database,
+            "filesize" => &f.file_size,
+            "context" => &f.context_name,
+            _ => return 0,
+        };
+        unsafe { copy_to_buf(value, buf, buf_sz) as c_int }
+    })
+    .unwrap_or(0)
+}
+unsafe extern "C" fn vararg_HB_Pot_GetPresetMetadata(
+    args: *mut *mut c_void,
+    n: c_int,
+) -> *mut c_void {
+    let field = str_arg(args, n, 1).map(|s| s.as_ptr()).unwrap_or(std::ptr::null());
+    ret_int(HB_Pot_GetPresetMetadata(
+        int_arg(args, n, 0),
+        field,
+        buf_arg(args, n, 2),
+        int_arg(args, n, 3),
+    ))
+}
+
+extern "C" fn HB_Pot_IsPresetFavorite(index: c_int) -> c_int {
+    with_pot_unit(|_, unit| {
+        let Some(id) = u32::try_from(index)
+            .ok()
+            .and_then(|i| unit.find_preset_id_at_index(i))
+        else {
+            return 0;
+        };
+        let favs = crate::standalone_unit::favorites()
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        favs.is_favorite(id) as c_int
+    })
+    .unwrap_or(0)
+}
+unsafe extern "C" fn vararg_HB_Pot_IsPresetFavorite(args: *mut *mut c_void, n: c_int) -> *mut c_void {
+    ret_int(HB_Pot_IsPresetFavorite(int_arg(args, n, 0)))
+}
+
+extern "C" fn HB_Pot_TogglePresetFavorite(index: c_int) {
+    with_pot_unit(|_, unit| {
+        if let Some(id) = u32::try_from(index)
+            .ok()
+            .and_then(|i| unit.find_preset_id_at_index(i))
+        {
+            let mut favs = crate::standalone_unit::favorites()
+                .write()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            favs.toggle_favorite(id);
+        }
+    });
+}
+unsafe extern "C" fn vararg_HB_Pot_TogglePresetFavorite(
+    args: *mut *mut c_void,
+    n: c_int,
+) -> *mut c_void {
+    HB_Pot_TogglePresetFavorite(int_arg(args, n, 0));
+    std::ptr::null_mut()
+}
+
 extern "C" fn HB_Pot_SupportsFilter(kind: *const c_char) -> c_int {
     if kind.is_null() {
         return 0;
@@ -776,6 +886,9 @@ macro_rules! paste_vararg {
     (HB_Pot_SetUseWildcards) => { vararg_HB_Pot_SetUseWildcards };
     (HB_Pot_IsFilterItemExcluded) => { vararg_HB_Pot_IsFilterItemExcluded };
     (HB_Pot_SetFilterItemExcluded) => { vararg_HB_Pot_SetFilterItemExcluded };
+    (HB_Pot_GetPresetMetadata) => { vararg_HB_Pot_GetPresetMetadata };
+    (HB_Pot_IsPresetFavorite) => { vararg_HB_Pot_IsPresetFavorite };
+    (HB_Pot_TogglePresetFavorite) => { vararg_HB_Pot_TogglePresetFavorite };
 }
 
 fn pot_api_fns() -> Vec<PotApiFn> {
@@ -844,6 +957,12 @@ fn pot_api_fns() -> Vec<PotApiFn> {
             b"int\0const char*,int\0kind,index\0Returns 1 if the filter item at the given index of the given kind is globally excluded.\0";
         HB_Pot_SetFilterItemExcluded:
             b"void\0const char*,int,int\0kind,index,excluded\0Globally excludes (excluded=1) or re-includes (excluded=0) the given filter item.\0";
+        HB_Pot_GetPresetMetadata:
+            b"int\0int,const char*,char*,int\0index,field,valueOut,valueOut_sz\0Gets a metadata field of the preset at the given index. field: vendor, author, comment, date, database, filesize, context. Returns 0 on failure.\0";
+        HB_Pot_IsPresetFavorite:
+            b"int\0int\0index\0Returns 1 if the preset at the given index is marked as a favorite.\0";
+        HB_Pot_TogglePresetFavorite:
+            b"void\0int\0index\0Toggles the favorite mark of the preset at the given index.\0";
     ]
 }
 

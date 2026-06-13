@@ -299,6 +299,47 @@ local function reveal_or_copy(path)
   end
 end
 
+local function meta(i, field)
+  local ok, v = r.HB_Pot_GetPresetMetadata(i, field)
+  return (ok ~= 0) and v or ''
+end
+
+-- Info block for the currently selected preset: favorite toggle, name, source database
+-- and product, and the metadata fields the original shows.
+local function selected_preset_info()
+  local sel = r.HB_Pot_GetSelectedPresetIndex()
+  if sel < 0 then
+    r.ImGui_TextDisabled(ctx, 'No preset selected')
+    return
+  end
+  local fav = r.HB_Pot_IsPresetFavorite(sel) ~= 0
+  if r.ImGui_Button(ctx, (fav and '\u{2605}' or '\u{2606}') .. '##fav') then
+    r.HB_Pot_TogglePresetFavorite(sel)
+  end
+  r.ImGui_SameLine(ctx)
+  local ok, name = r.HB_Pot_GetPresetName(sel)
+  r.ImGui_Text(ctx, ok ~= 0 and name or '')
+
+  local db = meta(sel, 'database')
+  local _, product = r.HB_Pot_GetPresetProduct(sel)
+  if db ~= '' then
+    r.ImGui_SameLine(ctx); r.ImGui_TextDisabled(ctx, 'from ' .. db)
+  end
+  if product and product ~= '' then
+    r.ImGui_SameLine(ctx); r.ImGui_TextDisabled(ctx, 'for ' .. product)
+  end
+
+  -- Secondary metadata line: only show the fields that are present.
+  local parts = {}
+  for _, fld in ipairs({ 'vendor', 'author', 'date', 'filesize' }) do
+    local v = meta(sel, fld)
+    if v ~= '' then parts[#parts + 1] = v end
+  end
+  if #parts > 0 then r.ImGui_TextDisabled(ctx, table.concat(parts, '   |   ')) end
+  local comment = meta(sel, 'comment')
+  if comment ~= '' then r.ImGui_TextWrapped(ctx, comment) end
+end
+
 local function preset_table()
   local count = r.HB_Pot_GetPresetCount()
   if count < 0 then
@@ -461,6 +502,8 @@ local function frame()
     r.ImGui_SameLine(ctx)
   end
   r.ImGui_NewLine(ctx)
+  r.ImGui_Separator(ctx)
+  selected_preset_info()
   r.ImGui_Separator(ctx)
   preset_table()
 end
