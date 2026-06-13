@@ -53,5 +53,5 @@ poll progress, handle failures. Recording stays in Rust
 (`pot/src/preview_recorder.rs`); Lua drives the wizard UI.
 
 ## Status
-- Groups 1 and 2: in progress.
-- Groups 3–5: planned.
+- Groups 1, 2 and 3: implemented (pending manual testing in REAPER).
+- Groups 4 (crawler) and 5 (preview recorder): planned next.

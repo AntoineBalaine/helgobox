@@ -30,6 +30,22 @@ thread_local! {
     /// Main-thread-only on purpose: loading constructs REAPER handles, and all consumers
     /// (the ReaScript API) run on the main thread anyway.
     static STANDALONE_POT_UNIT: RefCell<PotUnit> = RefCell::new(PotUnit::default());
+    /// The FX a preset was last loaded into, plus the preset's macro-parameter info.
+    /// Drives the macro-parameter panel. (The full plugin keeps this in ReaLearn's
+    /// Backbone; standalone keeps its own.)
+    static CURRENT_FX_PRESET: RefCell<Option<(Fx, CurrentPreset)>> = const { RefCell::new(None) };
+}
+
+/// Runs `f` with the current preset of the given FX, if one was loaded into it.
+pub fn with_current_preset<R>(fx: &Fx, f: impl FnOnce(Option<&CurrentPreset>) -> R) -> R {
+    CURRENT_FX_PRESET.with(|c| {
+        let cell = c.borrow();
+        let cp = cell
+            .as_ref()
+            .filter(|(stored_fx, _)| stored_fx == fx)
+            .map(|(_, preset)| preset);
+        f(cp)
+    })
 }
 
 /// Returns the global, instance-independent pot unit, loading it on first use.
@@ -96,8 +112,10 @@ impl PotIntegration for StandalonePotIntegration {
         &FAVORITES
     }
 
-    fn set_current_fx_preset(&self, _fx: Fx, _preset: CurrentPreset) {
-        // No ReaLearn UI to update in standalone mode.
+    fn set_current_fx_preset(&self, fx: Fx, preset: CurrentPreset) {
+        // Remember it so the macro-parameter panel can show this preset's parameters
+        // for the FX it was loaded into.
+        CURRENT_FX_PRESET.with(|c| *c.borrow_mut() = Some((fx, preset)));
     }
 
     fn exclude_list(&self) -> RwLockReadGuard<PotFilterExcludes> {

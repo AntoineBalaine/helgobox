@@ -435,6 +435,51 @@ local function options_popup()
   end
 end
 
+local macro_bank_index = 0
+
+-- Macro-parameter panel for the preset loaded into the destination FX. Only shows once a
+-- preset with parameter banks has been loaded (double-click a preset).
+local function macro_panel()
+  local bank_count = r.HB_Pot_GetMacroBankCount()
+  if bank_count <= 0 then return end
+  if macro_bank_index >= bank_count then macro_bank_index = 0 end
+  if bank_count > 1 then
+    local _, bname = r.HB_Pot_GetMacroBankName(macro_bank_index)
+    r.ImGui_SetNextItemWidth(ctx, 200)
+    if r.ImGui_BeginCombo(ctx, 'Bank', bname or '') then
+      for b = 0, bank_count - 1 do
+        local _, n = r.HB_Pot_GetMacroBankName(b)
+        if r.ImGui_Selectable(ctx, (n or tostring(b)) .. '##mb' .. b, b == macro_bank_index) then
+          macro_bank_index = b
+        end
+      end
+      r.ImGui_EndCombo(ctx)
+    end
+  end
+  local pcount = r.HB_Pot_GetMacroParamCount(macro_bank_index)
+  for slot = 0, pcount - 1 do
+    if slot > 0 then r.ImGui_SameLine(ctx) end
+    r.ImGui_BeginGroup(ctx)
+    local _, section = r.HB_Pot_GetMacroParamSection(macro_bank_index, slot)
+    if section and section ~= '' then r.ImGui_TextDisabled(ctx, section) end
+    local _, pname = r.HB_Pot_GetMacroParamName(macro_bank_index, slot)
+    r.ImGui_Text(ctx, pname or '')
+    local val = r.HB_Pot_GetMacroParamValue(macro_bank_index, slot)
+    if val < 0 then
+      r.ImGui_TextDisabled(ctx, '(n/a)')
+    else
+      local _, label = r.HB_Pot_GetMacroParamValueLabel(macro_bank_index, slot)
+      -- A plug-in value label may contain '%', which SliderInt would treat as a printf
+      -- specifier; escape it.
+      label = (label or ''):gsub('%%', '%%%%')
+      r.ImGui_SetNextItemWidth(ctx, 90)
+      local changed, new_val = r.ImGui_SliderInt(ctx, '##mp' .. slot, val, 0, 1000, label)
+      if changed then r.HB_Pot_SetMacroParamValue(macro_bank_index, slot, new_val) end
+    end
+    r.ImGui_EndGroup(ctx)
+  end
+end
+
 -- "Load into <track> at <fx>" plus show-chain / show-fx buttons.
 local function destination_panel()
   local function track_label(code)
@@ -546,6 +591,7 @@ end
 local function frame()
   toolbar()
   destination_panel()
+  macro_panel()
   -- Hierarchical filters (gated ones only when relevant + non-empty)
   local shown = 0
   for _, kind in ipairs(FILTER_KINDS) do

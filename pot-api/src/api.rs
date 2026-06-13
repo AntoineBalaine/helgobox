@@ -26,8 +26,9 @@ use pot::{
     pot_db, preview_exists, ChangeHint, Debounce, LoadPresetOptions, PotPreset, PotPresetKind,
     PresetId, RuntimePotUnit, SharedRuntimePotUnit,
 };
-use reaper_high::Reaper;
-use reaper_medium::ReaperVolumeValue;
+use pot::CurrentPreset;
+use reaper_high::{Fx, FxParameter, Reaper};
+use reaper_medium::{ReaperNormalizedFxParamValue, ReaperVolumeValue};
 use reaper_low::raw::ApiVararg;
 use reaper_medium::RegistrationObject;
 use std::cell::RefCell;
@@ -931,6 +932,228 @@ unsafe extern "C" fn vararg_HB_Pot_SetNameTrackAfterPreset(args: *mut *mut c_voi
     std::ptr::null_mut()
 }
 
+// ---------------------------------------------------------------------------
+// Macro-parameter panel
+// ---------------------------------------------------------------------------
+//
+// Shows the macro parameters of the preset that was loaded into the current destination
+// FX. The preset's macro→FX-parameter mapping comes from the stored CurrentPreset; the
+// live values are read/written on the resolved destination FX.
+
+/// Runs `f` with the destination FX and the current preset loaded into it, if any.
+fn with_macro_preset<R>(
+    unit: &RuntimePotUnit,
+    f: impl FnOnce(&Fx, &CurrentPreset) -> R,
+) -> Option<R> {
+    let fx = unit
+        .resolve_destination()
+        .ok()?
+        .get_existing()
+        .and_then(|d| d.resolve())?;
+    crate::standalone_unit::with_current_preset(&fx, |cp| cp.map(|cp| f(&fx, cp)))
+}
+
+/// Resolves the live FX parameter behind a macro slot, if it exists in the actual plug-in.
+fn macro_fx_param(fx: &Fx, cp: &CurrentPreset, bank: u32, slot: c_int) -> Option<FxParameter> {
+    let slot = usize::try_from(slot).ok()?;
+    let bank = cp.find_macro_param_bank_at(bank)?;
+    let macro_param = bank.params().get(slot)?;
+    let index = macro_param.fx_param?.resolved_param_index?;
+    let param = fx.parameter_by_index(index);
+    if param.is_available() {
+        Some(param)
+    } else {
+        None
+    }
+}
+
+extern "C" fn HB_Pot_GetMacroBankCount() -> c_int {
+    with_pot_unit(|_, unit| {
+        with_macro_preset(unit, |_, cp| cp.macro_param_bank_count() as c_int).unwrap_or(0)
+    })
+    .unwrap_or(0)
+}
+unsafe extern "C" fn vararg_HB_Pot_GetMacroBankCount(_: *mut *mut c_void, _: c_int) -> *mut c_void {
+    ret_int(HB_Pot_GetMacroBankCount())
+}
+
+extern "C" fn HB_Pot_GetMacroBankName(bank: c_int, buf: *mut c_char, buf_sz: c_int) -> c_int {
+    let Some(bank) = u32::try_from(bank).ok() else {
+        return 0;
+    };
+    with_pot_unit(|_, unit| {
+        with_macro_preset(unit, |_, cp| {
+            let Some(b) = cp.find_macro_param_bank_at(bank) else {
+                return 0;
+            };
+            unsafe { copy_to_buf(&b.name(), buf, buf_sz) as c_int }
+        })
+        .unwrap_or(0)
+    })
+    .unwrap_or(0)
+}
+unsafe extern "C" fn vararg_HB_Pot_GetMacroBankName(args: *mut *mut c_void, n: c_int) -> *mut c_void {
+    ret_int(HB_Pot_GetMacroBankName(
+        int_arg(args, n, 0),
+        buf_arg(args, n, 1),
+        int_arg(args, n, 2),
+    ))
+}
+
+extern "C" fn HB_Pot_GetMacroParamCount(bank: c_int) -> c_int {
+    let Some(bank) = u32::try_from(bank).ok() else {
+        return 0;
+    };
+    with_pot_unit(|_, unit| {
+        with_macro_preset(unit, |_, cp| {
+            cp.find_macro_param_bank_at(bank)
+                .map(|b| b.param_count() as c_int)
+                .unwrap_or(0)
+        })
+        .unwrap_or(0)
+    })
+    .unwrap_or(0)
+}
+unsafe extern "C" fn vararg_HB_Pot_GetMacroParamCount(args: *mut *mut c_void, n: c_int) -> *mut c_void {
+    ret_int(HB_Pot_GetMacroParamCount(int_arg(args, n, 0)))
+}
+
+extern "C" fn HB_Pot_GetMacroParamName(
+    bank: c_int,
+    slot: c_int,
+    buf: *mut c_char,
+    buf_sz: c_int,
+) -> c_int {
+    let Some(bank) = u32::try_from(bank).ok() else {
+        return 0;
+    };
+    let Some(slot) = usize::try_from(slot).ok() else {
+        return 0;
+    };
+    with_pot_unit(|_, unit| {
+        with_macro_preset(unit, |_, cp| {
+            let Some(p) = cp.find_macro_param_bank_at(bank).and_then(|b| b.params().get(slot)) else {
+                return 0;
+            };
+            unsafe { copy_to_buf(&p.name, buf, buf_sz) as c_int }
+        })
+        .unwrap_or(0)
+    })
+    .unwrap_or(0)
+}
+unsafe extern "C" fn vararg_HB_Pot_GetMacroParamName(args: *mut *mut c_void, n: c_int) -> *mut c_void {
+    ret_int(HB_Pot_GetMacroParamName(
+        int_arg(args, n, 0),
+        int_arg(args, n, 1),
+        buf_arg(args, n, 2),
+        int_arg(args, n, 3),
+    ))
+}
+
+extern "C" fn HB_Pot_GetMacroParamSection(
+    bank: c_int,
+    slot: c_int,
+    buf: *mut c_char,
+    buf_sz: c_int,
+) -> c_int {
+    let Some(bank) = u32::try_from(bank).ok() else {
+        return 0;
+    };
+    let Some(slot) = usize::try_from(slot).ok() else {
+        return 0;
+    };
+    with_pot_unit(|_, unit| {
+        with_macro_preset(unit, |_, cp| {
+            let Some(p) = cp.find_macro_param_bank_at(bank).and_then(|b| b.params().get(slot)) else {
+                return 0;
+            };
+            let section = p.section.as_deref().unwrap_or("");
+            unsafe { copy_to_buf(section, buf, buf_sz) as c_int }
+        })
+        .unwrap_or(0)
+    })
+    .unwrap_or(0)
+}
+unsafe extern "C" fn vararg_HB_Pot_GetMacroParamSection(args: *mut *mut c_void, n: c_int) -> *mut c_void {
+    ret_int(HB_Pot_GetMacroParamSection(
+        int_arg(args, n, 0),
+        int_arg(args, n, 1),
+        buf_arg(args, n, 2),
+        int_arg(args, n, 3),
+    ))
+}
+
+/// Returns the macro parameter's current value as permille (0-1000), or -1 if the slot
+/// has no resolvable live FX parameter (i.e. nothing to control).
+extern "C" fn HB_Pot_GetMacroParamValue(bank: c_int, slot: c_int) -> c_int {
+    let Some(bank) = u32::try_from(bank).ok() else {
+        return -1;
+    };
+    with_pot_unit(|_, unit| {
+        with_macro_preset(unit, |fx, cp| {
+            macro_fx_param(fx, cp, bank, slot)
+                .map(|p| (p.reaper_normalized_value().get() * 1000.0).round() as c_int)
+                .unwrap_or(-1)
+        })
+        .unwrap_or(-1)
+    })
+    .unwrap_or(-1)
+}
+unsafe extern "C" fn vararg_HB_Pot_GetMacroParamValue(args: *mut *mut c_void, n: c_int) -> *mut c_void {
+    ret_int(HB_Pot_GetMacroParamValue(int_arg(args, n, 0), int_arg(args, n, 1)))
+}
+
+extern "C" fn HB_Pot_GetMacroParamValueLabel(
+    bank: c_int,
+    slot: c_int,
+    buf: *mut c_char,
+    buf_sz: c_int,
+) -> c_int {
+    let Some(bank) = u32::try_from(bank).ok() else {
+        return 0;
+    };
+    with_pot_unit(|_, unit| {
+        with_macro_preset(unit, |fx, cp| {
+            let Some(p) = macro_fx_param(fx, cp, bank, slot) else {
+                return 0;
+            };
+            let label = p
+                .format_reaper_normalized_value(p.reaper_normalized_value())
+                .map(|s| s.into_string())
+                .unwrap_or_default();
+            unsafe { copy_to_buf(&label, buf, buf_sz) as c_int }
+        })
+        .unwrap_or(0)
+    })
+    .unwrap_or(0)
+}
+unsafe extern "C" fn vararg_HB_Pot_GetMacroParamValueLabel(args: *mut *mut c_void, n: c_int) -> *mut c_void {
+    ret_int(HB_Pot_GetMacroParamValueLabel(
+        int_arg(args, n, 0),
+        int_arg(args, n, 1),
+        buf_arg(args, n, 2),
+        int_arg(args, n, 3),
+    ))
+}
+
+extern "C" fn HB_Pot_SetMacroParamValue(bank: c_int, slot: c_int, permille: c_int) {
+    let Some(bank) = u32::try_from(bank).ok() else {
+        return;
+    };
+    let value = (permille.clamp(0, 1000) as f64) / 1000.0;
+    with_pot_unit(|_, unit| {
+        with_macro_preset(unit, |fx, cp| {
+            if let Some(p) = macro_fx_param(fx, cp, bank, slot) {
+                let _ = p.set_reaper_normalized_value(ReaperNormalizedFxParamValue::new(value));
+            }
+        });
+    });
+}
+unsafe extern "C" fn vararg_HB_Pot_SetMacroParamValue(args: *mut *mut c_void, n: c_int) -> *mut c_void {
+    HB_Pot_SetMacroParamValue(int_arg(args, n, 0), int_arg(args, n, 1), int_arg(args, n, 2));
+    std::ptr::null_mut()
+}
+
 extern "C" fn HB_Pot_SupportsFilter(kind: *const c_char) -> c_int {
     if kind.is_null() {
         return 0;
@@ -1144,6 +1367,14 @@ macro_rules! paste_vararg {
     (HB_Pot_SetLoadWindowBehavior) => { vararg_HB_Pot_SetLoadWindowBehavior };
     (HB_Pot_GetNameTrackAfterPreset) => { vararg_HB_Pot_GetNameTrackAfterPreset };
     (HB_Pot_SetNameTrackAfterPreset) => { vararg_HB_Pot_SetNameTrackAfterPreset };
+    (HB_Pot_GetMacroBankCount) => { vararg_HB_Pot_GetMacroBankCount };
+    (HB_Pot_GetMacroBankName) => { vararg_HB_Pot_GetMacroBankName };
+    (HB_Pot_GetMacroParamCount) => { vararg_HB_Pot_GetMacroParamCount };
+    (HB_Pot_GetMacroParamName) => { vararg_HB_Pot_GetMacroParamName };
+    (HB_Pot_GetMacroParamSection) => { vararg_HB_Pot_GetMacroParamSection };
+    (HB_Pot_GetMacroParamValue) => { vararg_HB_Pot_GetMacroParamValue };
+    (HB_Pot_GetMacroParamValueLabel) => { vararg_HB_Pot_GetMacroParamValueLabel };
+    (HB_Pot_SetMacroParamValue) => { vararg_HB_Pot_SetMacroParamValue };
 }
 
 fn pot_api_fns() -> Vec<PotApiFn> {
@@ -1250,6 +1481,22 @@ fn pot_api_fns() -> Vec<PotApiFn> {
             b"int\0\0\0Returns 1 if the destination track is renamed after the loaded preset.\0";
         HB_Pot_SetNameTrackAfterPreset:
             b"void\0int\0on\0Enables or disables renaming the destination track after the loaded preset.\0";
+        HB_Pot_GetMacroBankCount:
+            b"int\0\0\0Returns the number of macro-parameter banks of the preset loaded into the destination FX (0 if none).\0";
+        HB_Pot_GetMacroBankName:
+            b"int\0int,char*,int\0bank,nameOut,nameOut_sz\0Gets the name of the given macro-parameter bank. Returns 0 on failure.\0";
+        HB_Pot_GetMacroParamCount:
+            b"int\0int\0bank\0Returns the number of parameter slots in the given macro-parameter bank.\0";
+        HB_Pot_GetMacroParamName:
+            b"int\0int,int,char*,int\0bank,slot,nameOut,nameOut_sz\0Gets the macro name of the given bank/slot. Returns 0 on failure.\0";
+        HB_Pot_GetMacroParamSection:
+            b"int\0int,int,char*,int\0bank,slot,sectionOut,sectionOut_sz\0Gets the section label of the given bank/slot (may be empty). Returns 0 on failure.\0";
+        HB_Pot_GetMacroParamValue:
+            b"int\0int,int\0bank,slot\0Returns the macro slot's current value as permille (0-1000), or -1 if it has no live FX parameter.\0";
+        HB_Pot_GetMacroParamValueLabel:
+            b"int\0int,int,char*,int\0bank,slot,labelOut,labelOut_sz\0Gets the plug-in-formatted current value of the given macro slot. Returns 0 on failure.\0";
+        HB_Pot_SetMacroParamValue:
+            b"void\0int,int,int\0bank,slot,permille\0Sets the given macro slot's live FX parameter to the given permille value (0-1000).\0";
     ]
 }
 
