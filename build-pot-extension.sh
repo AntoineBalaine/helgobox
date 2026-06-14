@@ -15,7 +15,15 @@ fi
 
 cargo build -p pot-extension "${build_args[@]}"
 
+# cargo emits the lib-prefixed cdylib with a platform-specific extension; REAPER expects
+# reaper_pot.<ext> (no "lib" prefix). macOS uses .dylib, Linux .so, Windows .dll.
+case "$(uname -s)" in
+    Darwin)        src=libreaper_pot.dylib; dst=reaper_pot.dylib ;;
+    MINGW*|MSYS*|CYGWIN*) src=reaper_pot.dll; dst=reaper_pot.dll ;;
+    *)             src=libreaper_pot.so;    dst=reaper_pot.so ;;
+esac
+
 cd "target/$profile_dir"
-test -f libreaper_pot.so
-mv -f libreaper_pot.so reaper_pot.so
-echo "Built target/$profile_dir/reaper_pot.so"
+test -f "$src"
+mv -f "$src" "$dst"
+echo "Built target/$profile_dir/$dst"
