@@ -1479,6 +1479,125 @@ unsafe extern "C" fn vararg_HB_Pot_CrawlerDiscard(_: *mut *mut c_void, _: c_int)
     std::ptr::null_mut()
 }
 
+// ---------------------------------------------------------------------------
+// Preview recorder
+// ---------------------------------------------------------------------------
+
+extern "C" fn HB_Pot_RecorderPrepare(mode: c_int) -> c_int {
+    crate::recorder::prepare(mode)
+}
+unsafe extern "C" fn vararg_HB_Pot_RecorderPrepare(args: *mut *mut c_void, n: c_int) -> *mut c_void {
+    ret_int(HB_Pot_RecorderPrepare(int_arg(args, n, 0)))
+}
+
+extern "C" fn HB_Pot_RecorderPhase() -> c_int {
+    crate::recorder::phase_code()
+}
+unsafe extern "C" fn vararg_HB_Pot_RecorderPhase(_: *mut *mut c_void, _: c_int) -> *mut c_void {
+    ret_int(HB_Pot_RecorderPhase())
+}
+
+extern "C" fn HB_Pot_RecorderIsRunning() -> c_int {
+    crate::recorder::is_running() as c_int
+}
+unsafe extern "C" fn vararg_HB_Pot_RecorderIsRunning(_: *mut *mut c_void, _: c_int) -> *mut c_void {
+    ret_int(HB_Pot_RecorderIsRunning())
+}
+
+extern "C" fn HB_Pot_RecorderPreparedCount() -> c_int {
+    crate::recorder::prepared_count()
+}
+unsafe extern "C" fn vararg_HB_Pot_RecorderPreparedCount(
+    _: *mut *mut c_void,
+    _: c_int,
+) -> *mut c_void {
+    ret_int(HB_Pot_RecorderPreparedCount())
+}
+
+extern "C" fn HB_Pot_RecorderStart() -> c_int {
+    crate::recorder::start()
+}
+unsafe extern "C" fn vararg_HB_Pot_RecorderStart(_: *mut *mut c_void, _: c_int) -> *mut c_void {
+    ret_int(HB_Pot_RecorderStart())
+}
+
+extern "C" fn HB_Pot_RecorderTodoCount() -> c_int {
+    crate::recorder::todo_count()
+}
+unsafe extern "C" fn vararg_HB_Pot_RecorderTodoCount(_: *mut *mut c_void, _: c_int) -> *mut c_void {
+    ret_int(HB_Pot_RecorderTodoCount())
+}
+
+extern "C" fn HB_Pot_RecorderFailureCount() -> c_int {
+    crate::recorder::failure_count()
+}
+unsafe extern "C" fn vararg_HB_Pot_RecorderFailureCount(
+    _: *mut *mut c_void,
+    _: c_int,
+) -> *mut c_void {
+    ret_int(HB_Pot_RecorderFailureCount())
+}
+
+extern "C" fn HB_Pot_RecorderFailureName(index: c_int, buf: *mut c_char, buf_sz: c_int) -> c_int {
+    crate::recorder::with_failure_name(index, |name| unsafe {
+        copy_to_buf(name, buf, buf_sz) as c_int
+    })
+    .unwrap_or(0)
+}
+unsafe extern "C" fn vararg_HB_Pot_RecorderFailureName(
+    args: *mut *mut c_void,
+    n: c_int,
+) -> *mut c_void {
+    ret_int(HB_Pot_RecorderFailureName(
+        int_arg(args, n, 0),
+        buf_arg(args, n, 1),
+        int_arg(args, n, 2),
+    ))
+}
+
+extern "C" fn HB_Pot_RecorderFailureReason(index: c_int, buf: *mut c_char, buf_sz: c_int) -> c_int {
+    crate::recorder::with_failure_reason(index, |reason| unsafe {
+        copy_to_buf(reason, buf, buf_sz) as c_int
+    })
+    .unwrap_or(0)
+}
+unsafe extern "C" fn vararg_HB_Pot_RecorderFailureReason(
+    args: *mut *mut c_void,
+    n: c_int,
+) -> *mut c_void {
+    ret_int(HB_Pot_RecorderFailureReason(
+        int_arg(args, n, 0),
+        buf_arg(args, n, 1),
+        int_arg(args, n, 2),
+    ))
+}
+
+extern "C" fn HB_Pot_RecorderExportDir(buf: *mut c_char, buf_sz: c_int) -> c_int {
+    crate::recorder::with_export_dir(|dir| unsafe { copy_to_buf(dir, buf, buf_sz) as c_int })
+        .unwrap_or(0)
+}
+unsafe extern "C" fn vararg_HB_Pot_RecorderExportDir(
+    args: *mut *mut c_void,
+    n: c_int,
+) -> *mut c_void {
+    ret_int(HB_Pot_RecorderExportDir(buf_arg(args, n, 0), int_arg(args, n, 1)))
+}
+
+extern "C" fn HB_Pot_RecorderError(buf: *mut c_char, buf_sz: c_int) -> c_int {
+    crate::recorder::with_error(|e| unsafe { copy_to_buf(e, buf, buf_sz) as c_int }).unwrap_or(0)
+}
+unsafe extern "C" fn vararg_HB_Pot_RecorderError(args: *mut *mut c_void, n: c_int) -> *mut c_void {
+    ret_int(HB_Pot_RecorderError(buf_arg(args, n, 0), int_arg(args, n, 1)))
+}
+
+extern "C" fn HB_Pot_RecorderDiscard() {
+    crate::recorder::discard();
+}
+unsafe extern "C" fn vararg_HB_Pot_RecorderDiscard(_: *mut *mut c_void, _: c_int) -> *mut c_void {
+    HB_Pot_RecorderDiscard();
+    std::ptr::null_mut()
+}
+
 // ============================================================================
 // Registration
 // ============================================================================
@@ -1584,6 +1703,18 @@ macro_rules! paste_vararg {
     (HB_Pot_CrawlerError) => { vararg_HB_Pot_CrawlerError };
     (HB_Pot_CrawlerImport) => { vararg_HB_Pot_CrawlerImport };
     (HB_Pot_CrawlerDiscard) => { vararg_HB_Pot_CrawlerDiscard };
+    (HB_Pot_RecorderPrepare) => { vararg_HB_Pot_RecorderPrepare };
+    (HB_Pot_RecorderPhase) => { vararg_HB_Pot_RecorderPhase };
+    (HB_Pot_RecorderIsRunning) => { vararg_HB_Pot_RecorderIsRunning };
+    (HB_Pot_RecorderPreparedCount) => { vararg_HB_Pot_RecorderPreparedCount };
+    (HB_Pot_RecorderStart) => { vararg_HB_Pot_RecorderStart };
+    (HB_Pot_RecorderTodoCount) => { vararg_HB_Pot_RecorderTodoCount };
+    (HB_Pot_RecorderFailureCount) => { vararg_HB_Pot_RecorderFailureCount };
+    (HB_Pot_RecorderFailureName) => { vararg_HB_Pot_RecorderFailureName };
+    (HB_Pot_RecorderFailureReason) => { vararg_HB_Pot_RecorderFailureReason };
+    (HB_Pot_RecorderExportDir) => { vararg_HB_Pot_RecorderExportDir };
+    (HB_Pot_RecorderError) => { vararg_HB_Pot_RecorderError };
+    (HB_Pot_RecorderDiscard) => { vararg_HB_Pot_RecorderDiscard };
 }
 
 fn pot_api_fns() -> Vec<PotApiFn> {
@@ -1736,6 +1867,30 @@ fn pot_api_fns() -> Vec<PotApiFn> {
             b"int\0\0\0Imports the crawled presets to disk and refreshes the database. Returns 1 if the import was started, 0 if there's nothing to import.\0";
         HB_Pot_CrawlerDiscard:
             b"void\0\0\0Discards the current crawl session (drops the results and closes the temp file).\0";
+        HB_Pot_RecorderPrepare:
+            b"int\0int\0mode\0Gathers the presets to record. mode: 0=record for Pot Browser playback (only presets without a preview), 1=export to a folder. Returns 1 if preparation started. Poll HB_Pot_RecorderPhase for completion.\0";
+        HB_Pot_RecorderPhase:
+            b"int\0\0\0Returns the recorder phase: 0=idle, 1=preparing, 2=ready (prepared, not started), 3=recording, 4=done, 5=failed.\0";
+        HB_Pot_RecorderIsRunning:
+            b"int\0\0\0Returns 1 while preparing or recording.\0";
+        HB_Pot_RecorderPreparedCount:
+            b"int\0\0\0Returns the number of presets gathered by the last prepare step.\0";
+        HB_Pot_RecorderStart:
+            b"int\0\0\0Starts recording the prepared presets. Returns 1 if started, 0 otherwise (e.g. export template needs review first - see HB_Pot_RecorderError).\0";
+        HB_Pot_RecorderTodoCount:
+            b"int\0\0\0Returns the number of presets still left to record, or -1 if not recording.\0";
+        HB_Pot_RecorderFailureCount:
+            b"int\0\0\0Returns the number of presets that failed to record.\0";
+        HB_Pot_RecorderFailureName:
+            b"int\0int,char*,int\0index,nameOut,nameOut_sz\0Gets the preset name of the given failure. Returns 0 on failure.\0";
+        HB_Pot_RecorderFailureReason:
+            b"int\0int,char*,int\0index,reasonOut,reasonOut_sz\0Gets the reason of the given failure. Returns 0 on failure.\0";
+        HB_Pot_RecorderExportDir:
+            b"int\0char*,int\0dirOut,dirOut_sz\0Gets the export directory (export mode only). Returns 0 if not an export session.\0";
+        HB_Pot_RecorderError:
+            b"int\0char*,int\0errorOut,errorOut_sz\0Gets the last recorder error message. Returns 0 if there was none.\0";
+        HB_Pot_RecorderDiscard:
+            b"void\0\0\0Discards the current recorder session.\0";
     ]
 }
 

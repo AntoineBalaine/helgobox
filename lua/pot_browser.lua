@@ -68,6 +68,14 @@ local crawler = {
   overlay_armed = false,
 }
 
+-- Preview Recorder wizard state. `step`: intro | preparing | ready | recording | done
+-- | failed. `mode`: 0 = record for Pot Browser playback, 1 = export.
+local recorder = {
+  open = false,
+  step = 'intro',
+  mode = 0,
+}
+
 local FILTER_WIDTH = 170
 local POPUP_WIDTH = 240
 local LIST_HEIGHT = 200
@@ -603,6 +611,14 @@ local function toolbar()
       crawler.step = 'intro'
     end
   end
+  -- Preview Recorder (only when the standalone extension exposes the recorder API).
+  if r.HB_Pot_RecorderPrepare then
+    r.ImGui_SameLine(ctx)
+    if r.ImGui_Button(ctx, 'Recorder') then
+      recorder.open = true
+      recorder.step = 'intro'
+    end
+  end
   if r.HB_Pot_IsBusy() ~= 0 then
     r.ImGui_SameLine(ctx)
     r.ImGui_Text(ctx, 'scanning...')
@@ -770,6 +786,91 @@ local function crawler_render()
   r.ImGui_End(ctx)
 end
 
+local function recorder_close()
+  r.HB_Pot_RecorderDiscard()
+  recorder.open = false
+end
+
+local function recorder_render()
+  if not recorder.open then return end
+  r.ImGui_SetNextWindowSize(ctx, 480, 360, r.ImGui_Cond_FirstUseEver())
+  local visible, open = r.ImGui_Begin(ctx, 'Preview Recorder', true)
+  if not open then recorder.open = false end
+  if not visible then return end
+
+  local step = recorder.step
+  if step == 'intro' then
+    r.ImGui_TextWrapped(ctx,
+      'The recorder loads each matching instrument preset, renders a short audio preview, '
+      .. 'and saves it. Use "playback" to fill in previews missing from the browser, or '
+      .. '"export" to render previews to a folder.')
+    r.ImGui_Separator(ctx)
+    if r.ImGui_Button(ctx, 'Cancel') then recorder.open = false end
+    r.ImGui_SameLine(ctx)
+    if r.ImGui_Button(ctx, 'Record for Pot Browser playback') then
+      recorder.mode = 0
+      recorder.step = (r.HB_Pot_RecorderPrepare(0) ~= 0) and 'preparing' or 'failed'
+    end
+    r.ImGui_SameLine(ctx)
+    if r.ImGui_Button(ctx, 'Record and export') then
+      recorder.mode = 1
+      recorder.step = (r.HB_Pot_RecorderPrepare(1) ~= 0) and 'preparing' or 'failed'
+    end
+  elseif step == 'preparing' then
+    r.ImGui_Text(ctx, 'Gathering presets...')
+    local phase = r.HB_Pot_RecorderPhase()
+    if phase == 2 then recorder.step = 'ready'
+    elseif phase == 5 then recorder.step = 'failed' end
+  elseif step == 'ready' then
+    r.ImGui_Text(ctx, string.format('Ready to record %d presets.', r.HB_Pot_RecorderPreparedCount()))
+    r.ImGui_TextWrapped(ctx, 'Recording opens a temporary project and renders each preset. '
+      .. 'Leave REAPER alone while it runs; press Escape to stop early.')
+    r.ImGui_Separator(ctx)
+    if r.ImGui_Button(ctx, 'Start recording') then
+      recorder.step = (r.HB_Pot_RecorderStart() ~= 0) and 'recording' or 'failed'
+    end
+    r.ImGui_SameLine(ctx)
+    if r.ImGui_Button(ctx, 'Cancel') then recorder_close() end
+  elseif step == 'recording' then
+    r.ImGui_Text(ctx, 'Recording previews... (press Escape to stop)')
+    r.ImGui_Separator(ctx)
+    r.ImGui_Text(ctx, string.format('Presets left: %d', r.HB_Pot_RecorderTodoCount()))
+    r.ImGui_Text(ctx, string.format('Failures: %d', r.HB_Pot_RecorderFailureCount()))
+    local phase = r.HB_Pot_RecorderPhase()
+    if phase == 4 then recorder.step = 'done'
+    elseif phase == 5 then recorder.step = 'failed' end
+  elseif step == 'done' then
+    r.ImGui_Text(ctx, 'Recording finished.')
+    local left = r.HB_Pot_RecorderTodoCount()
+    if left > 0 then r.ImGui_Text(ctx, string.format('Not recorded (stopped early): %d', left)) end
+    local fcount = r.HB_Pot_RecorderFailureCount()
+    r.ImGui_Text(ctx, string.format('Failures: %d', fcount))
+    if recorder.mode == 1 then
+      local dok, dir = r.HB_Pot_RecorderExportDir()
+      if dok ~= 0 then r.ImGui_TextWrapped(ctx, 'Exported to: ' .. dir) end
+    end
+    if fcount > 0 then
+      r.ImGui_Separator(ctx)
+      if r.ImGui_BeginChild(ctx, 'rec_failures', 0, 140) then
+        for i = 0, fcount - 1 do
+          local nok, name = r.HB_Pot_RecorderFailureName(i)
+          local rok, reason = r.HB_Pot_RecorderFailureReason(i)
+          r.ImGui_TextWrapped(ctx, string.format('%s  -  %s',
+            (nok ~= 0) and name or '?', (rok ~= 0) and reason or ''))
+        end
+      end
+      r.ImGui_EndChild(ctx)
+    end
+    if r.ImGui_Button(ctx, 'Close') then recorder_close() end
+  elseif step == 'failed' then
+    r.ImGui_TextColored(ctx, 0xFF6060FF, 'Preview recorder stopped.')
+    local eok, emsg = r.HB_Pot_RecorderError()
+    if eok ~= 0 and emsg ~= '' then r.ImGui_TextWrapped(ctx, emsg) end
+    if r.ImGui_Button(ctx, 'Close') then recorder_close() end
+  end
+  r.ImGui_End(ctx)
+end
+
 local function frame()
   toolbar()
   destination_panel()
@@ -824,8 +925,9 @@ local function loop()
     frame()
     r.ImGui_End(ctx)
   end
-  -- The crawler wizard is its own window, drawn outside the main window's scope.
+  -- The wizards are their own windows, drawn outside the main window's scope.
   if crawler.open then crawler_render() end
+  if recorder.open then recorder_render() end
   if open then r.defer(loop) end
 end
 

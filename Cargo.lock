@@ -4912,11 +4912,13 @@ name = "pot-api"
 version = "0.1.0"
 dependencies = [
  "base",
+ "camino",
  "helgobox-api",
  "pot",
  "reaper-high",
  "reaper-low",
  "reaper-medium",
+ "strum",
  "swell-ui",
 ]
 

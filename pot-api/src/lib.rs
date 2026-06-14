@@ -8,6 +8,7 @@
 mod api;
 mod crawler;
 mod executor;
+mod recorder;
 mod standalone_unit;
 
 pub use api::register_pot_api;

@@ -16,6 +16,8 @@ reaper-medium.workspace = true
 reaper-low.workspace = true
 # For iterating LoadPresetWindowBehavior variants (as_ref names + iter)
 strum.workspace = true
+# UTF-8 paths for the preview recorder (preview RPP template, export dirs)
+camino.workspace = true
 
 [lints.clippy]
 enum_glob_use = "deny"

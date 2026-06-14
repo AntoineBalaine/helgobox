@@ -34,5 +34,7 @@ pub fn run_tasks() {
             mw.0.run();
             mw.1.run();
         });
+        // Hand any finished background preset-gathering back to the recorder session.
+        crate::recorder::poll();
     });
 }
