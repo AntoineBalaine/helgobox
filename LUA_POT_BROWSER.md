@@ -44,24 +44,53 @@ palette, so it is deliberately out of scope.
   Required making the standalone unit *store* the current FX preset (it was a no-op).
 - [ ] Deferred (low value): associated products, stats panel, add project database.
 
-### Group 4 — Preset Crawler (required)
+### Group 4 — Preset Crawler (required) — DONE (commit 83cfca06)
 Control surface over the existing Rust crawler: start a crawl with the captured mouse
 positions (incl. the "Save Preset As" scraping option), poll progress/state, import or
 discard the result. The crawl loop, mouse automation, and scraping stay in Rust
 (`pot/src/preset_crawler.rs`); Lua drives the wizard UI.
+- [x] `HB_Pot_Crawler*` API over `crawl_presets` + `import_crawled_presets`
+  (`pot-api/src/crawler.rs`): start / phase / preset+duplicate counts / last preset /
+  stop reason / import / discard, plus `HB_Pot_GetFocusedFxName` /
+  `HB_Pot_IsFocusedFxOpenFloating` for the precondition.
+- [x] Async driver: `HB_Pot_RunTasks` pumps the main-thread future/task middlewares
+  (`pot-api/src/executor.rs`), called once per frame by the Lua loop.
+- [x] Lua wizard with full-screen-overlay click capture of button positions
+  (native coords via `ImGui_PointConvertNative`). Spike: `lua/overlay_capture_spike.lua`.
 
-### Group 5 — Preview Recorder (required)
+### Group 5 — Preview Recorder (required) — DONE (commit 1f3a3fdd)
 Control surface over the existing Rust preview recorder: choose output mode, start,
 poll progress, handle failures. Recording stays in Rust
 (`pot/src/preview_recorder.rs`); Lua drives the wizard UI.
+- [x] `HB_Pot_Recorder*` API over `prepare_preview_recording` + `record_previews`
+  (`pot-api/src/recorder.rs`): prepare (on the pot worker) / phase / prepared count /
+  start / todo+failure counts / per-failure name+reason / export dir / error / discard.
+- [x] Embeds the `pot-preview.RPP` template via `include_bytes!`; export mode copies a
+  user-customizable template like the egui version.
+- [x] Lua wizard: mode choice, preparing, ready, recording progress, done (failure list
+  / export dir).
 
 ## Status (2026-06-14)
 
-Groups 1, 2 and 3 are implemented and compile cleanly (`cargo check -p pot-api`).
-They have **not** been run in REAPER from this environment — ReaImGui and the egui build
-can't run in the dev sandbox — so they need a `reaper_pot` rebuild + script reload to
-confirm behavior. The Lua browser now has parity with the original egui Pot Browser for
-everything except the two wizards (groups 4 and 5), which are not started.
+All five groups are implemented and compile cleanly (`cargo check -p pot-api` and
+`-p pot-extension`). They have **not** been run in REAPER from this environment —
+ReaImGui and the egui build can't run in the dev sandbox — so they need a `reaper_pot`
+rebuild + script reload to confirm behavior. The Lua browser now has full feature parity
+with the original egui Pot Browser, including the Preset Crawler and Preview Recorder
+wizards.
+
+Open verification items for the user's machine:
+- Groups 1–3 behavior (never run in REAPER yet).
+- Group 4: the full-screen-overlay click capture — confirm a borderless top-most
+  ReaImGui window actually overlays the plug-in window and reports clicks (test with
+  `lua/overlay_capture_spike.lua`). If ReaImGui clamps the window, fall back to
+  keypress-while-hovering capture (same `ImGui_PointConvertNative` coordinate path).
+- Group 5: the preview RPP template resolution and the render action in the standalone
+  context.
+
+Note on the dev sandbox: cross-user file permissions break the shared cargo registry and
+`target/` dir, so `cargo check` must be run with a private `CARGO_HOME` +
+`CARGO_TARGET_DIR` (see `AGENTS.md`).
 
 ### `HB_Pot_*` API surface (in `pot-api/src/api.rs`)
 
@@ -83,6 +112,15 @@ ReaScript, `APIdef_*` for the docs). Strings use caller buffers (Lua sees plain 
   `Get/SetNameTrackAfterPreset`
 - Macro panel: `GetMacroBankCount/Name`, `GetMacroParamCount/Name/Section`,
   `Get/SetMacroParamValue` (permille), `GetMacroParamValueLabel`
+- Tasks: `RunTasks` (pumps the async executor each frame)
+- Crawler (group 4): `GetFocusedFxName`, `IsFocusedFxOpenFloating`, `CrawlerStart`,
+  `CrawlerPhase`, `CrawlerIsRunning`, `CrawlerPresetCount`, `CrawlerDuplicateCount`,
+  `CrawlerCrawledCount`, `CrawlerLastPresetName`, `CrawlerStopReason`,
+  `CrawlerStopReasonLabel`, `CrawlerError`, `CrawlerImport`, `CrawlerDiscard`
+- Recorder (group 5): `RecorderPrepare`, `RecorderPhase`, `RecorderIsRunning`,
+  `RecorderPreparedCount`, `RecorderStart`, `RecorderTodoCount`, `RecorderFailureCount`,
+  `RecorderFailureName`, `RecorderFailureReason`, `RecorderExportDir`, `RecorderError`,
+  `RecorderDiscard`
 
 ### Architecture notes
 - `pot-api` owns a global, instance-independent pot unit (`standalone_unit.rs`) with a
@@ -93,6 +131,11 @@ ReaScript, `APIdef_*` for the docs). Strings use caller buffers (Lua sees plain 
   SWELL + reaper-high, registers the API, and runs the database scan (`warm_up`).
 - All API entry points are wrapped in `reaper_low::firewall`, so a panic returns safely
   instead of aborting REAPER across the C ABI.
+- Async wizards (groups 4/5): the crawl/record futures run on the main thread via
+  `spawn_in_main_thread_from_main_thread` and are pumped by `executor.rs`'s middlewares,
+  which the Lua loop ticks through `HB_Pot_RunTasks`. The recorder's slow preset-gathering
+  runs on the pot worker thread and is handed back via a global slot polled each frame.
+  Session state lives in main-thread thread-locals (`crawler.rs`, `recorder.rs`).
 
 ### Code review (2026-06-13) findings + fixes (commit d23dc18a)
 - **Fixed (real defect):** `standalone_pot_unit()` built a fresh integration on every
@@ -109,7 +152,8 @@ ReaScript, `APIdef_*` for the docs). Strings use caller buffers (Lua sees plain 
   unbounded-lifetime `str_arg` (standard FFI, used immediately).
 
 ### Next
-- Group 4 (Preset Crawler) and Group 5 (Preview Recorder): each needs a control-surface
-  `HB_Pot_*` API over the existing Rust implementations (`pot/src/preset_crawler.rs`,
-  `pot/src/preview_recorder.rs`); the crawl/record loops and mouse automation stay in Rust.
-- Manual REAPER verification of groups 1–3 on the user's machine.
+- Manual REAPER verification on the user's machine: groups 1–3 behavior, the group 4
+  overlay click-capture (spike `lua/overlay_capture_spike.lua` first), and group 5
+  preview-template resolution + render in the standalone context.
+- If the overlay capture doesn't overlay the plug-in window, switch the crawler capture
+  to keypress-while-hovering (same coordinate path, no overlay).
