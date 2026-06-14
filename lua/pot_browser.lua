@@ -55,6 +55,19 @@ local volume_before_mute = nil -- non-nil while muted
 
 local filter_search_state = {}
 
+-- Preset Crawler wizard state. `step`: intro | capture | crawling | stopped | importing
+-- | done | failed. `points`: captured native screen coords in order
+-- {next-preset, save-as button, cancel button}.
+local crawler = {
+  open = false,
+  step = 'intro',
+  stop_if_dest = false,
+  never_stop = false,
+  use_save_as = false,
+  points = {},
+  overlay_armed = false,
+}
+
 local FILTER_WIDTH = 170
 local POPUP_WIDTH = 240
 local LIST_HEIGHT = 200
@@ -582,10 +595,179 @@ local function toolbar()
   r.ImGui_SameLine(ctx)
   local apc, ap = r.ImGui_Checkbox(ctx, 'Auto-preview', auto_preview)
   if apc then auto_preview = ap end
+  -- Preset Crawler (only when the standalone extension exposes the crawler API).
+  if r.HB_Pot_CrawlerStart then
+    r.ImGui_SameLine(ctx)
+    if r.ImGui_Button(ctx, 'Crawler') then
+      crawler.open = true
+      crawler.step = 'intro'
+    end
+  end
   if r.HB_Pot_IsBusy() ~= 0 then
     r.ImGui_SameLine(ctx)
     r.ImGui_Text(ctx, 'scanning...')
   end
+end
+
+-- Order of the screen positions the crawler needs to capture by click.
+local CRAWL_CAPTURE_LABELS = {
+  'the plug-in\'s "Next preset" button',
+  'the plug-in\'s "Save Preset As" button',
+  'the Save-As dialog\'s "Cancel" button',
+}
+
+local function crawler_points_needed()
+  return crawler.use_save_as and 3 or 1
+end
+
+-- Full-screen, borderless, top-most, transparent overlay that captures click positions in
+-- native (OS) screen coordinates -- the coordinate space the Rust mouse automation uses.
+local function crawler_overlay()
+  local vp = r.ImGui_GetMainViewport(ctx)
+  local vx, vy = r.ImGui_Viewport_GetPos(vp)
+  local vw, vh = r.ImGui_Viewport_GetSize(vp)
+  r.ImGui_SetNextWindowPos(ctx, vx, vy)
+  r.ImGui_SetNextWindowSize(ctx, vw, vh)
+  local flags = r.ImGui_WindowFlags_NoDecoration()
+      | r.ImGui_WindowFlags_NoMove()
+      | r.ImGui_WindowFlags_NoResize()
+      | r.ImGui_WindowFlags_NoSavedSettings()
+      | r.ImGui_WindowFlags_NoNav()
+      | r.ImGui_WindowFlags_NoBackground()
+      | r.ImGui_WindowFlags_TopMost()
+  if r.ImGui_Begin(ctx, '##crawl_overlay', true, flags) then
+    local dl = r.ImGui_GetWindowDrawList(ctx)
+    r.ImGui_DrawList_AddRectFilled(dl, vx, vy, vx + vw, vy + vh, 0x10183050)
+    local mx, my = r.ImGui_GetMousePos(ctx)
+    r.ImGui_DrawList_AddLine(dl, mx - 14, my, mx + 14, my, 0xFFEE00FF, 1.5)
+    r.ImGui_DrawList_AddLine(dl, mx, my - 14, mx, my + 14, 0xFFEE00FF, 1.5)
+    local idx = #crawler.points + 1
+    r.ImGui_DrawList_AddText(dl, vx + 24, vy + 24, 0xFFFFFFFF,
+      'Click ' .. (CRAWL_CAPTURE_LABELS[idx] or 'the target') .. '   (Esc to cancel capture)')
+    if r.ImGui_IsMouseClicked(ctx, 0) then
+      local nx, ny = r.ImGui_PointConvertNative(ctx, mx, my, true)
+      crawler.points[#crawler.points + 1] = { math.floor(nx + 0.5), math.floor(ny + 0.5) }
+      if #crawler.points >= crawler_points_needed() then crawler.overlay_armed = false end
+    end
+    if r.ImGui_IsKeyPressed(ctx, r.ImGui_Key_Escape(), false) then
+      crawler.overlay_armed = false
+    end
+    r.ImGui_End(ctx)
+  end
+end
+
+local function crawler_close()
+  r.HB_Pot_CrawlerDiscard()
+  crawler.open = false
+end
+
+local function crawler_render()
+  if not crawler.open then return end
+  -- The capture overlay sits above everything while armed.
+  if crawler.step == 'capture' and crawler.overlay_armed then crawler_overlay() end
+
+  r.ImGui_SetNextWindowSize(ctx, 480, 340, r.ImGui_Cond_FirstUseEver())
+  local visible, open = r.ImGui_Begin(ctx, 'Preset Crawler', true)
+  if not open then crawler.open = false end
+  if not visible then return end
+
+  local step = crawler.step
+  if step == 'intro' then
+    r.ImGui_TextWrapped(ctx,
+      'The crawler steps a plug-in through its presets by clicking its "Next preset" '
+      .. 'button and saving each one. Open the plug-in in a FLOATING FX window first, then '
+      .. 'capture the button positions.')
+    r.ImGui_Separator(ctx)
+    local fxok, fxname = r.HB_Pot_GetFocusedFxName()
+    local floating = r.HB_Pot_IsFocusedFxOpenFloating() ~= 0
+    if fxok ~= 0 then
+      r.ImGui_Text(ctx, 'Focused FX: ' .. fxname)
+    else
+      r.ImGui_TextDisabled(ctx, 'No FX focused.')
+    end
+    if not floating then
+      r.ImGui_TextColored(ctx, 0xFF6060FF, 'The focused FX must be open in a floating window.')
+    end
+    r.ImGui_Separator(ctx)
+    local c1, v1 = r.ImGui_Checkbox(ctx, 'Stop if a destination file already exists', crawler.stop_if_dest)
+    if c1 then crawler.stop_if_dest = v1 end
+    local c2, v2 = r.ImGui_Checkbox(ctx, 'Never stop automatically (crawl until Escape)', crawler.never_stop)
+    if c2 then crawler.never_stop = v2 end
+    local c3, v3 = r.ImGui_Checkbox(ctx, 'Scrape names from the "Save Preset As" dialog', crawler.use_save_as)
+    if c3 then crawler.use_save_as = v3 end
+    r.ImGui_Separator(ctx)
+    if r.ImGui_Button(ctx, 'Cancel') then crawler.open = false end
+    r.ImGui_SameLine(ctx)
+    if not floating then r.ImGui_BeginDisabled(ctx) end
+    if r.ImGui_Button(ctx, 'Capture positions') then
+      crawler.points = {}
+      crawler.overlay_armed = true
+      crawler.step = 'capture'
+    end
+    if not floating then r.ImGui_EndDisabled(ctx) end
+  elseif step == 'capture' then
+    r.ImGui_TextWrapped(ctx, 'Capturing screen positions by click. The overlay covers the '
+      .. 'screen; click each requested target. Re-capture if you mis-clicked.')
+    r.ImGui_Text(ctx, string.format('Captured %d / %d', #crawler.points, crawler_points_needed()))
+    for i, p in ipairs(crawler.points) do
+      r.ImGui_Text(ctx, string.format('  %d. %s  ->  (%d, %d)',
+        i, CRAWL_CAPTURE_LABELS[i] or '?', p[1], p[2]))
+    end
+    if not crawler.overlay_armed then
+      if r.ImGui_Button(ctx, 'Re-capture') then
+        crawler.points = {}
+        crawler.overlay_armed = true
+      end
+      r.ImGui_SameLine(ctx)
+      if #crawler.points >= crawler_points_needed() then
+        if r.ImGui_Button(ctx, 'Start crawling') then
+          local p = crawler.points
+          local sx, sy = (p[2] and p[2][1] or 0), (p[2] and p[2][2] or 0)
+          local cx, cy = (p[3] and p[3][1] or 0), (p[3] and p[3][2] or 0)
+          local started = r.HB_Pot_CrawlerStart(p[1][1], p[1][2],
+            crawler.stop_if_dest and 1 or 0, crawler.never_stop and 1 or 0,
+            crawler.use_save_as and 1 or 0, sx, sy, cx, cy)
+          crawler.step = (started ~= 0) and 'crawling' or 'failed'
+        end
+        r.ImGui_SameLine(ctx)
+      end
+      if r.ImGui_Button(ctx, 'Back') then crawler.step = 'intro' end
+    end
+  elseif step == 'crawling' then
+    r.ImGui_Text(ctx, 'Crawling... press Escape (over the plug-in) to stop.')
+    r.ImGui_Separator(ctx)
+    r.ImGui_Text(ctx, string.format('Presets crawled: %d', r.HB_Pot_CrawlerPresetCount()))
+    r.ImGui_Text(ctx, string.format('Skipped (duplicate name): %d', r.HB_Pot_CrawlerDuplicateCount()))
+    local lok, lname = r.HB_Pot_CrawlerLastPresetName()
+    r.ImGui_Text(ctx, 'Last crawled: ' .. ((lok ~= 0) and lname or '-'))
+    local phase = r.HB_Pot_CrawlerPhase()
+    if phase == 2 then crawler.step = 'stopped'
+    elseif phase == 5 then crawler.step = 'failed' end
+  elseif step == 'stopped' then
+    r.ImGui_Text(ctx, string.format('Crawled %d presets.', r.HB_Pot_CrawlerCrawledCount()))
+    local sok, slabel = r.HB_Pot_CrawlerStopReasonLabel()
+    if sok ~= 0 and slabel ~= '' then r.ImGui_TextWrapped(ctx, slabel) end
+    r.ImGui_Separator(ctx)
+    if r.ImGui_Button(ctx, 'Import') then
+      crawler.step = (r.HB_Pot_CrawlerImport() ~= 0) and 'importing' or 'failed'
+    end
+    r.ImGui_SameLine(ctx)
+    if r.ImGui_Button(ctx, 'Discard') then crawler_close() end
+  elseif step == 'importing' then
+    r.ImGui_Text(ctx, 'Importing crawled presets...')
+    local phase = r.HB_Pot_CrawlerPhase()
+    if phase == 4 then crawler.step = 'done'
+    elseif phase == 5 then crawler.step = 'failed' end
+  elseif step == 'done' then
+    r.ImGui_Text(ctx, string.format('Imported %d presets.', r.HB_Pot_CrawlerCrawledCount()))
+    if r.ImGui_Button(ctx, 'Close') then crawler_close() end
+  elseif step == 'failed' then
+    r.ImGui_TextColored(ctx, 0xFF6060FF, 'Crawler failed or was cancelled.')
+    local eok, emsg = r.HB_Pot_CrawlerError()
+    if eok ~= 0 and emsg ~= '' then r.ImGui_TextWrapped(ctx, emsg) end
+    if r.ImGui_Button(ctx, 'Close') then crawler_close() end
+  end
+  r.ImGui_End(ctx)
 end
 
 local function frame()
@@ -624,6 +806,9 @@ local function frame()
 end
 
 local function loop()
+  -- Pump the standalone extension's async executor so the crawler/recorder wizards make
+  -- progress. No-op on older binaries without the API.
+  if r.HB_Pot_RunTasks then r.HB_Pot_RunTasks() end
   -- The extension scans the databases at REAPER startup. Only trigger a scan ourselves
   -- if, by the time the window first opens, the engine is neither already scanning nor
   -- populated (i.e. the startup warm-up didn't run) - this avoids a redundant rescan.
@@ -639,6 +824,8 @@ local function loop()
     frame()
     r.ImGui_End(ctx)
   end
+  -- The crawler wizard is its own window, drawn outside the main window's scope.
+  if crawler.open then crawler_render() end
   if open then r.defer(loop) end
 end
 

@@ -1297,6 +1297,188 @@ unsafe extern "C" fn vararg_HB_Pot_SetFilterItemExcluded(
     std::ptr::null_mut()
 }
 
+// ---------------------------------------------------------------------------
+// Task pump
+// ---------------------------------------------------------------------------
+
+extern "C" fn HB_Pot_RunTasks() {
+    crate::executor::run_tasks();
+}
+unsafe extern "C" fn vararg_HB_Pot_RunTasks(_: *mut *mut c_void, _: c_int) -> *mut c_void {
+    HB_Pot_RunTasks();
+    std::ptr::null_mut()
+}
+
+// ---------------------------------------------------------------------------
+// Focused FX (preset crawler precondition)
+// ---------------------------------------------------------------------------
+
+extern "C" fn HB_Pot_GetFocusedFxName(buf: *mut c_char, buf_sz: c_int) -> c_int {
+    crate::crawler::with_focused_fx_name(|name| unsafe { copy_to_buf(name, buf, buf_sz) as c_int })
+        .unwrap_or(0)
+}
+unsafe extern "C" fn vararg_HB_Pot_GetFocusedFxName(
+    args: *mut *mut c_void,
+    n: c_int,
+) -> *mut c_void {
+    ret_int(HB_Pot_GetFocusedFxName(buf_arg(args, n, 0), int_arg(args, n, 1)))
+}
+
+extern "C" fn HB_Pot_IsFocusedFxOpenFloating() -> c_int {
+    crate::crawler::focused_fx_is_floating() as c_int
+}
+unsafe extern "C" fn vararg_HB_Pot_IsFocusedFxOpenFloating(
+    _: *mut *mut c_void,
+    _: c_int,
+) -> *mut c_void {
+    ret_int(HB_Pot_IsFocusedFxOpenFloating())
+}
+
+// ---------------------------------------------------------------------------
+// Preset crawler
+// ---------------------------------------------------------------------------
+
+#[allow(clippy::too_many_arguments)]
+extern "C" fn HB_Pot_CrawlerStart(
+    next_x: c_int,
+    next_y: c_int,
+    stop_if_destination_exists: c_int,
+    never_stop: c_int,
+    use_save_as: c_int,
+    save_x: c_int,
+    save_y: c_int,
+    cancel_x: c_int,
+    cancel_y: c_int,
+) -> c_int {
+    crate::crawler::start(
+        next_x,
+        next_y,
+        stop_if_destination_exists != 0,
+        never_stop != 0,
+        use_save_as != 0,
+        save_x,
+        save_y,
+        cancel_x,
+        cancel_y,
+    )
+}
+unsafe extern "C" fn vararg_HB_Pot_CrawlerStart(args: *mut *mut c_void, n: c_int) -> *mut c_void {
+    ret_int(HB_Pot_CrawlerStart(
+        int_arg(args, n, 0),
+        int_arg(args, n, 1),
+        int_arg(args, n, 2),
+        int_arg(args, n, 3),
+        int_arg(args, n, 4),
+        int_arg(args, n, 5),
+        int_arg(args, n, 6),
+        int_arg(args, n, 7),
+        int_arg(args, n, 8),
+    ))
+}
+
+extern "C" fn HB_Pot_CrawlerPhase() -> c_int {
+    crate::crawler::phase_code()
+}
+unsafe extern "C" fn vararg_HB_Pot_CrawlerPhase(_: *mut *mut c_void, _: c_int) -> *mut c_void {
+    ret_int(HB_Pot_CrawlerPhase())
+}
+
+extern "C" fn HB_Pot_CrawlerIsRunning() -> c_int {
+    crate::crawler::is_running() as c_int
+}
+unsafe extern "C" fn vararg_HB_Pot_CrawlerIsRunning(_: *mut *mut c_void, _: c_int) -> *mut c_void {
+    ret_int(HB_Pot_CrawlerIsRunning())
+}
+
+extern "C" fn HB_Pot_CrawlerPresetCount() -> c_int {
+    crate::crawler::preset_count()
+}
+unsafe extern "C" fn vararg_HB_Pot_CrawlerPresetCount(
+    _: *mut *mut c_void,
+    _: c_int,
+) -> *mut c_void {
+    ret_int(HB_Pot_CrawlerPresetCount())
+}
+
+extern "C" fn HB_Pot_CrawlerDuplicateCount() -> c_int {
+    crate::crawler::duplicate_count()
+}
+unsafe extern "C" fn vararg_HB_Pot_CrawlerDuplicateCount(
+    _: *mut *mut c_void,
+    _: c_int,
+) -> *mut c_void {
+    ret_int(HB_Pot_CrawlerDuplicateCount())
+}
+
+extern "C" fn HB_Pot_CrawlerCrawledCount() -> c_int {
+    crate::crawler::crawled_count()
+}
+unsafe extern "C" fn vararg_HB_Pot_CrawlerCrawledCount(
+    _: *mut *mut c_void,
+    _: c_int,
+) -> *mut c_void {
+    ret_int(HB_Pot_CrawlerCrawledCount())
+}
+
+extern "C" fn HB_Pot_CrawlerLastPresetName(buf: *mut c_char, buf_sz: c_int) -> c_int {
+    crate::crawler::with_last_preset_name(|name| unsafe { copy_to_buf(name, buf, buf_sz) as c_int })
+        .unwrap_or(0)
+}
+unsafe extern "C" fn vararg_HB_Pot_CrawlerLastPresetName(
+    args: *mut *mut c_void,
+    n: c_int,
+) -> *mut c_void {
+    ret_int(HB_Pot_CrawlerLastPresetName(
+        buf_arg(args, n, 0),
+        int_arg(args, n, 1),
+    ))
+}
+
+extern "C" fn HB_Pot_CrawlerStopReason() -> c_int {
+    crate::crawler::stop_reason_code()
+}
+unsafe extern "C" fn vararg_HB_Pot_CrawlerStopReason(
+    _: *mut *mut c_void,
+    _: c_int,
+) -> *mut c_void {
+    ret_int(HB_Pot_CrawlerStopReason())
+}
+
+extern "C" fn HB_Pot_CrawlerStopReasonLabel(buf: *mut c_char, buf_sz: c_int) -> c_int {
+    unsafe { copy_to_buf(crate::crawler::stop_reason_label(), buf, buf_sz) as c_int }
+}
+unsafe extern "C" fn vararg_HB_Pot_CrawlerStopReasonLabel(
+    args: *mut *mut c_void,
+    n: c_int,
+) -> *mut c_void {
+    ret_int(HB_Pot_CrawlerStopReasonLabel(
+        buf_arg(args, n, 0),
+        int_arg(args, n, 1),
+    ))
+}
+
+extern "C" fn HB_Pot_CrawlerError(buf: *mut c_char, buf_sz: c_int) -> c_int {
+    crate::crawler::with_error(|e| unsafe { copy_to_buf(e, buf, buf_sz) as c_int }).unwrap_or(0)
+}
+unsafe extern "C" fn vararg_HB_Pot_CrawlerError(args: *mut *mut c_void, n: c_int) -> *mut c_void {
+    ret_int(HB_Pot_CrawlerError(buf_arg(args, n, 0), int_arg(args, n, 1)))
+}
+
+extern "C" fn HB_Pot_CrawlerImport() -> c_int {
+    crate::crawler::import()
+}
+unsafe extern "C" fn vararg_HB_Pot_CrawlerImport(_: *mut *mut c_void, _: c_int) -> *mut c_void {
+    ret_int(HB_Pot_CrawlerImport())
+}
+
+extern "C" fn HB_Pot_CrawlerDiscard() {
+    crate::crawler::discard();
+}
+unsafe extern "C" fn vararg_HB_Pot_CrawlerDiscard(_: *mut *mut c_void, _: c_int) -> *mut c_void {
+    HB_Pot_CrawlerDiscard();
+    std::ptr::null_mut()
+}
+
 // ============================================================================
 // Registration
 // ============================================================================
@@ -1387,6 +1569,21 @@ macro_rules! paste_vararg {
     (HB_Pot_GetMacroParamValue) => { vararg_HB_Pot_GetMacroParamValue };
     (HB_Pot_GetMacroParamValueLabel) => { vararg_HB_Pot_GetMacroParamValueLabel };
     (HB_Pot_SetMacroParamValue) => { vararg_HB_Pot_SetMacroParamValue };
+    (HB_Pot_RunTasks) => { vararg_HB_Pot_RunTasks };
+    (HB_Pot_GetFocusedFxName) => { vararg_HB_Pot_GetFocusedFxName };
+    (HB_Pot_IsFocusedFxOpenFloating) => { vararg_HB_Pot_IsFocusedFxOpenFloating };
+    (HB_Pot_CrawlerStart) => { vararg_HB_Pot_CrawlerStart };
+    (HB_Pot_CrawlerPhase) => { vararg_HB_Pot_CrawlerPhase };
+    (HB_Pot_CrawlerIsRunning) => { vararg_HB_Pot_CrawlerIsRunning };
+    (HB_Pot_CrawlerPresetCount) => { vararg_HB_Pot_CrawlerPresetCount };
+    (HB_Pot_CrawlerDuplicateCount) => { vararg_HB_Pot_CrawlerDuplicateCount };
+    (HB_Pot_CrawlerCrawledCount) => { vararg_HB_Pot_CrawlerCrawledCount };
+    (HB_Pot_CrawlerLastPresetName) => { vararg_HB_Pot_CrawlerLastPresetName };
+    (HB_Pot_CrawlerStopReason) => { vararg_HB_Pot_CrawlerStopReason };
+    (HB_Pot_CrawlerStopReasonLabel) => { vararg_HB_Pot_CrawlerStopReasonLabel };
+    (HB_Pot_CrawlerError) => { vararg_HB_Pot_CrawlerError };
+    (HB_Pot_CrawlerImport) => { vararg_HB_Pot_CrawlerImport };
+    (HB_Pot_CrawlerDiscard) => { vararg_HB_Pot_CrawlerDiscard };
 }
 
 fn pot_api_fns() -> Vec<PotApiFn> {
@@ -1509,6 +1706,36 @@ fn pot_api_fns() -> Vec<PotApiFn> {
             b"int\0int,int,char*,int\0bank,slot,labelOut,labelOut_sz\0Gets the plug-in-formatted current value of the given macro slot. Returns 0 on failure.\0";
         HB_Pot_SetMacroParamValue:
             b"void\0int,int,int\0bank,slot,permille\0Sets the given macro slot's live FX parameter to the given permille value (0-1000).\0";
+        HB_Pot_RunTasks:
+            b"void\0\0\0Pumps the standalone extension's async task executor. Call once per frame from the script's defer loop so the crawler/recorder wizards make progress.\0";
+        HB_Pot_GetFocusedFxName:
+            b"int\0char*,int\0nameOut,nameOut_sz\0Gets the name of the currently focused FX, or 0 if none is focused.\0";
+        HB_Pot_IsFocusedFxOpenFloating:
+            b"int\0\0\0Returns 1 if there is a focused FX and it is open in a floating window (a precondition for the preset crawler).\0";
+        HB_Pot_CrawlerStart:
+            b"int\0int,int,int,int,int,int,int,int,int\0next_x,next_y,stop_if_destination_exists,never_stop,use_save_as,save_x,save_y,cancel_x,cancel_y\0Starts crawling the focused FX (must be open in a floating window). next_x/next_y: screen position of the plug-in's \"Next preset\" button. If use_save_as is 1, preset names are scraped from the plug-in's \"Save Preset As\" dialog using save_x/save_y (the dialog button) and cancel_x/cancel_y (its Cancel button). Returns 1 if started, 0 otherwise.\0";
+        HB_Pot_CrawlerPhase:
+            b"int\0\0\0Returns the crawler phase: 0=idle, 1=crawling, 2=stopped (ready to import/discard), 3=importing, 4=done, 5=failed.\0";
+        HB_Pot_CrawlerIsRunning:
+            b"int\0\0\0Returns 1 while a crawl or import is in progress.\0";
+        HB_Pot_CrawlerPresetCount:
+            b"int\0\0\0Returns the number of presets crawled so far.\0";
+        HB_Pot_CrawlerDuplicateCount:
+            b"int\0\0\0Returns the number of presets skipped so far because of a duplicate name.\0";
+        HB_Pot_CrawlerCrawledCount:
+            b"int\0\0\0Returns the number of distinct presets crawled, as captured when crawling stopped.\0";
+        HB_Pot_CrawlerLastPresetName:
+            b"int\0char*,int\0nameOut,nameOut_sz\0Gets the name of the most recently crawled preset. Returns 0 if none yet.\0";
+        HB_Pot_CrawlerStopReason:
+            b"int\0\0\0Returns the stop reason once crawling stopped: -1=none yet, 0=cancelled, 1=destination file exists, 2=preset name not changing, 3=wrapped to beginning.\0";
+        HB_Pot_CrawlerStopReasonLabel:
+            b"int\0char*,int\0labelOut,labelOut_sz\0Gets a human-readable explanation of the stop reason (empty if not stopped).\0";
+        HB_Pot_CrawlerError:
+            b"int\0char*,int\0errorOut,errorOut_sz\0Gets the last crawler error message. Returns 0 if there was none.\0";
+        HB_Pot_CrawlerImport:
+            b"int\0\0\0Imports the crawled presets to disk and refreshes the database. Returns 1 if the import was started, 0 if there's nothing to import.\0";
+        HB_Pot_CrawlerDiscard:
+            b"void\0\0\0Discards the current crawl session (drops the results and closes the temp file).\0";
     ]
 }
 
