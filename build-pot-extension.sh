@@ -13,7 +13,9 @@ if [[ "${1:-}" == "--release" ]]; then
     profile_dir="release-strip"
 fi
 
-cargo build -p pot-extension "${build_args[@]}"
+# Note the "${arr[@]+...}" guard: macOS ships bash 3.2, where expanding an empty array as
+# "${build_args[@]}" under `set -u` errors as an unbound variable.
+cargo build -p pot-extension ${build_args[@]+"${build_args[@]}"}
 
 # cargo emits the lib-prefixed cdylib with a platform-specific extension; REAPER expects
 # reaper_pot.<ext> (no "lib" prefix). macOS uses .dylib, Linux .so, Windows .dll.
