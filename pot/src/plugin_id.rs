@@ -106,9 +106,13 @@ impl Display for PluginIdContentInReaperFormat<'_> {
             PluginId::Vst2 { vst_magic_number } => vst_magic_number.fmt(f),
             PluginId::Vst3 { vst_uid } => {
                 // D39D5B69 D6AF42FA 12345678 534D4433
+                // Each 32-bit word MUST be zero-padded to 8 hex digits: REAPER's FX id and the
+                // parse format (`parse_vst3_uid`) are fixed 32-char strings. Without padding, a
+                // word with leading zeros (e.g. a trailing `0` word, as in Serum's uid) drops
+                // digits, the id no longer matches the loaded FX, and the FX gets wrongly removed.
                 write!(
                     f,
-                    "{:X}{:X}{:X}{:X}",
+                    "{:08X}{:08X}{:08X}{:08X}",
                     vst_uid[0], vst_uid[1], vst_uid[2], vst_uid[3],
                 )
             }
@@ -218,6 +222,23 @@ mod tests {
             Ok(PluginId::vst3([
                 0x56535450, 0x74387170, 0x69616E6F, 0x74657120
             ]))
+        );
+    }
+
+    #[test]
+    pub fn vst3_format_is_zero_padded() {
+        // Serum's uid: the last 32-bit word is 0. It must still format to a full 32-char string
+        // (8 hex digits per word), matching REAPER's FX id "56535458667358736572756D00000000" --
+        // not a truncated "56535458667358736572756D0".
+        let id = PluginId::vst3([0x56535458, 0x66735873, 0x6572756D, 0]);
+        assert_eq!(
+            id.content_formatted_for_reaper(),
+            "56535458667358736572756D00000000"
+        );
+        // Round-trips through the parser (which reads fixed 8-char components).
+        assert_eq!(
+            super::parse_vst3_uid(&id.content_formatted_for_reaper()),
+            Ok([0x56535458, 0x66735873, 0x6572756D, 0])
         );
     }
 
