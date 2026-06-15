@@ -222,6 +222,9 @@ pub struct CrawlPresetArgs<F> {
     /// dialog instead of asking the REAPER API. For plug-ins that don't expose their
     /// preset names.
     pub save_as_dialog: Option<SaveAsDialogScraping>,
+    /// If set, the "Next preset" action is performed by replaying this recorded macro
+    /// (verified, window-relative) instead of clicking `next_preset_cursor_pos`.
+    pub next_preset_macro: Option<RecordedMacro>,
     /// If set, preset names are scraped by replaying a recorded action macro (clicks +
     /// keystrokes) instead of the fixed two-position `save_as_dialog`. Takes precedence
     /// over `save_as_dialog` when both are set. See [`crate::preset_recorder`].
@@ -330,9 +333,19 @@ where
                 NextCrawlStep::Continue => {}
             }
         }
-        // Click "Next preset" button
+        // Advance to the next preset: replay the recorded macro if present (verified,
+        // window-relative), otherwise click the single captured position.
         args.fx.show_in_floating_window()?;
-        click_at(&mut mouse, args.next_preset_cursor_pos).await?;
+        if let Some(next_macro) = &args.next_preset_macro {
+            if !replay_macro(&mut mouse, next_macro, &escape_catcher).await? {
+                return Ok(PresetCrawlingOutcome::new(
+                    chunks_file,
+                    PresetCrawlerStopReason::Interrupted,
+                ));
+            }
+        } else {
+            click_at(&mut mouse, args.next_preset_cursor_pos).await?;
+        }
         a_bit_longer().await;
     }
 }
@@ -414,23 +427,58 @@ fn find_window_by_id(id: u32) -> Option<xcap::Window> {
     xcap::Window::all().ok()?.into_iter().find(|w| w.id() == id)
 }
 
-/// Replays a recorded save-as action macro, then reads the preset name from the clipboard.
+/// Resolves a recorded click to absolute screen coordinates.
 ///
-/// Each click is **verified** before firing: the macro stored which window the click landed
-/// in, and we re-resolve that window's current position and refuse to click unless it's the
-/// topmost window there — so a window that drifted or got covered aborts the crawl rather
-/// than clicking something random. Keys replay by physical position (`Key::Raw`), which
-/// reproduces the user's keystrokes under any keyboard layout.
-async fn replay_macro_and_scrape(
+/// - Window still open: re-resolve its current position and **verify it's topmost** at the
+///   target point; abort if a different window covers it (never click the wrong window).
+/// - Window gone: it was transient (a dialog or context menu that reopens with a fresh id,
+///   e.g. a native save panel or a right-click "Copy" menu). Fall back to the recorded
+///   absolute position — it reopens at the same place.
+///
+/// xcap `Window` handles are dropped before returning (they may be `!Send`, so must not be
+/// held across the caller's await points).
+fn resolve_click_target(
+    win_id: u32,
+    off_x: i32,
+    off_y: i32,
+    abs_x: i32,
+    abs_y: i32,
+) -> Result<(i32, i32), Box<dyn Error + Send + Sync>> {
+    if win_id == 0 {
+        return Ok((abs_x, abs_y));
+    }
+    match find_window_by_id(win_id) {
+        Some(win) => {
+            let (tx, ty) = (win.x() + off_x, win.y() + off_y);
+            match topmost_window_at(tx, ty) {
+                Some(top) if top.id() == win_id => Ok((tx, ty)),
+                Some(top) => Err(format!(
+                    "expected window {win_id} at ({tx},{ty}) but '{}' is on top — aborting to \
+                     avoid clicking the wrong window",
+                    top.app_name()
+                )
+                .into()),
+                None => Err(format!("no window at ({tx},{ty}) during replay").into()),
+            }
+        }
+        None => Ok((abs_x, abs_y)),
+    }
+}
+
+/// Replays a recorded action macro. Returns `Ok(false)` if the user pressed Escape.
+///
+/// Clicks are resolved/verified by [`resolve_click_target`]; keys replay by physical
+/// position (`Key::Raw`), which reproduces the user's keystrokes under any keyboard layout.
+/// Timing follows the recorded inter-event delays (with a fast down/up) so quick sequences
+/// like triple-clicks replay as triple-clicks rather than separate clicks.
+async fn replay_macro(
     mouse: &mut EnigoMouse,
     macro_events: &[InputEvent],
     escape_catcher: &EscapeCatcher,
-) -> Result<ScrapedName, Box<dyn Error + Send + Sync>> {
-    // Sentinel so we can tell whether the copy actually happened.
-    set_clipboard_text(CLIPBOARD_SENTINEL)?;
+) -> Result<bool, Box<dyn Error + Send + Sync>> {
     for ev in macro_events {
         if escape_catcher.escape_was_pressed() {
-            return Ok(ScrapedName::Interrupted);
+            return Ok(false);
         }
         match ev {
             InputEvent::Click {
@@ -438,46 +486,21 @@ async fn replay_macro_and_scrape(
                 win_id,
                 off_x,
                 off_y,
+                abs_x,
+                abs_y,
                 delay_ms,
-                ..
             } => {
                 millis((*delay_ms).min(5000)).await;
-                if *win_id == 0 {
-                    return Err("a recorded click has no associated window — on macOS, grant \
-                                Screen Recording so windows resolve, then re-record"
-                        .into());
-                }
-                // Re-resolve the target window's current rect and verify it's topmost. The
-                // xcap `Window` handles are dropped before any await (they may be !Send).
-                let (tx, ty) = {
-                    let win = find_window_by_id(*win_id)
-                        .ok_or("a window targeted by the recorded actions is no longer open")?;
-                    let (tx, ty) = (win.x() + off_x, win.y() + off_y);
-                    match topmost_window_at(tx, ty) {
-                        Some(top) if top.id() == *win_id => {}
-                        Some(top) => {
-                            return Err(format!(
-                                "expected window {win_id} at ({tx},{ty}) during replay but \
-                                 '{}' is on top — aborting to avoid clicking the wrong window",
-                                top.app_name()
-                            )
-                            .into());
-                        }
-                        None => {
-                            return Err(format!("no window at ({tx},{ty}) during replay").into());
-                        }
-                    }
-                    (tx, ty)
-                };
+                let (tx, ty) = resolve_click_target(*win_id, *off_x, *off_y, *abs_x, *abs_y)?;
                 let pos = MouseCursorPosition::new(tx.max(0) as u32, ty.max(0) as u32);
                 mouse.set_cursor_position(pos)?;
-                moment().await;
+                millis(12).await;
                 let b = match button {
                     ClickButton::Left => MouseButton::Left,
                     ClickButton::Right => MouseButton::Right,
                 };
                 mouse.press(b)?;
-                moment().await;
+                millis(12).await;
                 mouse.release(b)?;
             }
             InputEvent::KeyDown { raw, delay_ms } => {
@@ -489,6 +512,20 @@ async fn replay_macro_and_scrape(
                 mouse.release_raw_key(*raw);
             }
         }
+    }
+    Ok(true)
+}
+
+/// Replays a recorded save-as macro, then reads the preset name from the clipboard.
+async fn replay_macro_and_scrape(
+    mouse: &mut EnigoMouse,
+    macro_events: &[InputEvent],
+    escape_catcher: &EscapeCatcher,
+) -> Result<ScrapedName, Box<dyn Error + Send + Sync>> {
+    // Sentinel so we can tell whether the copy actually happened.
+    set_clipboard_text(CLIPBOARD_SENTINEL)?;
+    if !replay_macro(mouse, macro_events, escape_catcher).await? {
+        return Ok(ScrapedName::Interrupted);
     }
     a_bit_longer().await;
     let name = clipboard_text()?;

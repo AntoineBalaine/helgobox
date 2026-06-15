@@ -64,8 +64,6 @@ local crawler = {
   stop_if_dest = false,
   never_stop = false,
   use_save_as = false,
-  points = {},
-  overlay_armed = false,
   recording_started = false,
 }
 
@@ -630,60 +628,51 @@ local function toolbar()
   end
 end
 
--- The crawler captures one position by click (the plug-in's "Next preset" button). The
--- "Save Preset As" name-scrape is captured separately as an action recording, not points.
-local CRAWL_CAPTURE_LABELS = { 'the plug-in\'s "Next preset" button' }
-
-local function crawler_points_needed()
-  return 1
-end
-
--- Full-screen, borderless, top-most, transparent overlay that captures click positions in
--- native (OS) screen coordinates -- the coordinate space the Rust mouse automation uses.
-local function crawler_overlay()
-  local vp = r.ImGui_GetMainViewport(ctx)
-  local vx, vy = r.ImGui_Viewport_GetPos(vp)
-  local vw, vh = r.ImGui_Viewport_GetSize(vp)
-  r.ImGui_SetNextWindowPos(ctx, vx, vy)
-  r.ImGui_SetNextWindowSize(ctx, vw, vh)
-  local flags = r.ImGui_WindowFlags_NoDecoration()
-      | r.ImGui_WindowFlags_NoMove()
-      | r.ImGui_WindowFlags_NoResize()
-      | r.ImGui_WindowFlags_NoSavedSettings()
-      | r.ImGui_WindowFlags_NoNav()
-      | r.ImGui_WindowFlags_NoBackground()
-      | r.ImGui_WindowFlags_TopMost()
-  if r.ImGui_Begin(ctx, '##crawl_overlay', true, flags) then
-    local dl = r.ImGui_GetWindowDrawList(ctx)
-    r.ImGui_DrawList_AddRectFilled(dl, vx, vy, vx + vw, vy + vh, 0x10183050)
-    local mx, my = r.ImGui_GetMousePos(ctx)
-    r.ImGui_DrawList_AddLine(dl, mx - 14, my, mx + 14, my, 0xFFEE00FF, 1.5)
-    r.ImGui_DrawList_AddLine(dl, mx, my - 14, mx, my + 14, 0xFFEE00FF, 1.5)
-    local idx = #crawler.points + 1
-    r.ImGui_DrawList_AddText(dl, vx + 24, vy + 24, 0xFFFFFFFF,
-      'Click ' .. (CRAWL_CAPTURE_LABELS[idx] or 'the target') .. '   (Esc to cancel capture)')
-    if r.ImGui_IsMouseClicked(ctx, 0) then
-      local nx, ny = r.ImGui_PointConvertNative(ctx, mx, my, true)
-      crawler.points[#crawler.points + 1] = { math.floor(nx + 0.5), math.floor(ny + 0.5) }
-      if #crawler.points >= crawler_points_needed() then crawler.overlay_armed = false end
-    end
-    if r.ImGui_IsKeyPressed(ctx, r.ImGui_Key_Escape(), false) then
-      crawler.overlay_armed = false
-    end
-    r.ImGui_End(ctx)
-  end
-end
-
 local function crawler_close()
   r.HB_Pot_CrawlerDiscard()
   crawler.open = false
 end
 
+-- Record button + RECORDING indicator, classic red studio styling. `target`: 0 = next-
+-- preset, 1 = save-as. `what` describes the action for the prompt. Returns true once a
+-- macro with at least one event has been recorded for this target.
+local function crawler_record_ui(target, what)
+  if r.HB_Pot_CrawlerIsRecording() ~= 0 then
+    local count = r.HB_Pot_CrawlerRecordedCount(target)
+    r.ImGui_TextColored(ctx, 0xFF3030FF, string.format('\u{25CF} RECORDING   %d actions', count))
+    r.ImGui_TextWrapped(ctx, 'On the plug-in: ' .. what .. '   Then press ESC to finish.')
+    return false
+  end
+  -- Recording just ended (ESC) -> finalize and store the macro.
+  if crawler.recording_started then
+    r.HB_Pot_CrawlerRecordStop()
+    crawler.recording_started = false
+  end
+  local count = r.HB_Pot_CrawlerRecordedCount(target)
+  if count > 0 then
+    r.ImGui_Text(ctx, string.format('Recorded %d actions.', count))
+  end
+  r.ImGui_PushStyleColor(ctx, r.ImGui_Col_Button(), 0xB02828FF)
+  r.ImGui_PushStyleColor(ctx, r.ImGui_Col_ButtonHovered(), 0xD03838FF)
+  r.ImGui_PushStyleColor(ctx, r.ImGui_Col_ButtonActive(), 0xF04848FF)
+  local pressed = r.ImGui_Button(ctx, count > 0 and '\u{25CF} Re-record' or '\u{25CF} Record')
+  r.ImGui_PopStyleColor(ctx, 3)
+  if pressed then
+    r.HB_Pot_CrawlerRecordStart(target)
+    crawler.recording_started = true
+  end
+  return count > 0
+end
+
+local function crawler_start_crawl()
+  local started = r.HB_Pot_CrawlerStart(
+    crawler.stop_if_dest and 1 or 0, crawler.never_stop and 1 or 0,
+    crawler.use_save_as and 1 or 0)
+  crawler.step = (started ~= 0) and 'crawling' or 'failed'
+end
+
 local function crawler_render()
   if not crawler.open then return end
-  -- The capture overlay sits above everything while armed.
-  if crawler.step == 'capture' and crawler.overlay_armed then crawler_overlay() end
-
   r.ImGui_SetNextWindowSize(ctx, 480, 340, r.ImGui_Cond_FirstUseEver())
   local visible, open = r.ImGui_Begin(ctx, 'Preset Crawler', true)
   if not open then crawler.open = false end
@@ -692,9 +681,10 @@ local function crawler_render()
   local step = crawler.step
   if step == 'intro' then
     r.ImGui_TextWrapped(ctx,
-      'The crawler steps a plug-in through its presets by clicking its "Next preset" '
-      .. 'button and saving each one. Open the plug-in in a FLOATING FX window first, then '
-      .. 'capture the button positions.')
+      'The crawler steps a plug-in through its presets, saving each as an FX chain. Open the '
+      .. 'plug-in in a FLOATING FX window first. You record the "Next preset" click (and, if '
+      .. 'the plug-in hides its names, the "Save Preset As" name-grab) once; the crawler '
+      .. 'replays them per preset.')
     r.ImGui_Separator(ctx)
     local fxok, fxname = r.HB_Pot_GetFocusedFxName()
     local floating = r.HB_Pot_IsFocusedFxOpenFloating() ~= 0
@@ -717,75 +707,39 @@ local function crawler_render()
     if r.ImGui_Button(ctx, 'Cancel') then crawler.open = false end
     r.ImGui_SameLine(ctx)
     if not floating then r.ImGui_BeginDisabled(ctx) end
-    if r.ImGui_Button(ctx, 'Capture positions') then
-      crawler.points = {}
-      crawler.overlay_armed = true
-      crawler.step = 'capture'
-    end
+    if r.ImGui_Button(ctx, 'Begin: record Next-preset') then crawler.step = 'rec_next' end
     if not floating then r.ImGui_EndDisabled(ctx) end
-  elseif step == 'capture' then
-    r.ImGui_TextWrapped(ctx, 'Capturing screen positions by click. The overlay covers the '
-      .. 'screen; click each requested target. Re-capture if you mis-clicked.')
-    r.ImGui_Text(ctx, string.format('Captured %d / %d', #crawler.points, crawler_points_needed()))
-    for i, p in ipairs(crawler.points) do
-      r.ImGui_Text(ctx, string.format('  %d. %s  ->  (%d, %d)',
-        i, CRAWL_CAPTURE_LABELS[i] or '?', p[1], p[2]))
-    end
-    if not crawler.overlay_armed then
-      if r.ImGui_Button(ctx, 'Re-capture') then
-        crawler.points = {}
-        crawler.overlay_armed = true
-      end
-      r.ImGui_SameLine(ctx)
-      if #crawler.points >= 1 then
-        if crawler.use_save_as then
-          if r.ImGui_Button(ctx, 'Next: record save-as actions') then
-            crawler.step = 'record'
-          end
-        else
-          if r.ImGui_Button(ctx, 'Start crawling') then
-            local p = crawler.points
-            local started = r.HB_Pot_CrawlerStart(p[1][1], p[1][2],
-              crawler.stop_if_dest and 1 or 0, crawler.never_stop and 1 or 0, 0)
-            crawler.step = (started ~= 0) and 'crawling' or 'failed'
-          end
-        end
-        r.ImGui_SameLine(ctx)
-      end
-      if r.ImGui_Button(ctx, 'Back') then crawler.step = 'intro' end
-    end
-  elseif step == 'record' then
-    r.ImGui_TextWrapped(ctx, 'Record the "Save Preset As" name-grab once: click Record, then '
-      .. 'on the plug-in do the whole flow -- open Save As, click into the name field, '
-      .. 'select all and copy (Cmd/Ctrl+A, Cmd/Ctrl+C), then Cancel -- and press Escape to '
-      .. 'finish. It replays per preset to read each name.')
+  elseif step == 'rec_next' then
+    r.ImGui_TextWrapped(ctx, 'Record the "Next preset" click: hit Record, click the plug-in\'s '
+      .. 'Next-preset button, then press ESC.')
     r.ImGui_Separator(ctx)
-    local recording = r.HB_Pot_CrawlerIsRecording() ~= 0
-    local count = r.HB_Pot_CrawlerRecordedEventCount()
-    if recording then
-      r.ImGui_Text(ctx, string.format('Recording... %d actions. Press Escape when done.', count))
-    else
-      -- Recording just ended (Escape) -> finalize and store the macro.
-      if crawler.recording_started then
-        r.HB_Pot_CrawlerRecordStop()
-        crawler.recording_started = false
-      end
-      r.ImGui_Text(ctx, string.format('Recorded %d actions.', count))
-      if r.ImGui_Button(ctx, count > 0 and 'Re-record' or 'Record') then
-        r.HB_Pot_CrawlerRecordStart()
-        crawler.recording_started = true
-      end
-      r.ImGui_SameLine(ctx)
-      if count > 0 then
-        if r.ImGui_Button(ctx, 'Start crawling') then
-          local p = crawler.points
-          local started = r.HB_Pot_CrawlerStart(p[1][1], p[1][2],
-            crawler.stop_if_dest and 1 or 0, crawler.never_stop and 1 or 0, 1)
-          crawler.step = (started ~= 0) and 'crawling' or 'failed'
-        end
+    local done = crawler_record_ui(0, 'click the "Next preset" button.')
+    r.ImGui_Separator(ctx)
+    if r.HB_Pot_CrawlerIsRecording() == 0 then
+      if r.ImGui_Button(ctx, 'Cancel') then crawler_close() end
+      if done then
         r.ImGui_SameLine(ctx)
+        if crawler.use_save_as then
+          if r.ImGui_Button(ctx, 'Next: record Save-As') then crawler.step = 'rec_saveas' end
+        else
+          if r.ImGui_Button(ctx, 'Start crawling') then crawler_start_crawl() end
+        end
       end
-      if r.ImGui_Button(ctx, 'Back') then crawler.step = 'capture' end
+    end
+  elseif step == 'rec_saveas' then
+    r.ImGui_TextWrapped(ctx, 'Record the "Save Preset As" name-grab. It replays per preset to '
+      .. 'read each name.')
+    r.ImGui_Separator(ctx)
+    local done = crawler_record_ui(1,
+      'open Save As, select the name (triple-click the field), copy it (Cmd/Ctrl+C or '
+      .. 'right-click -> Copy), then Cancel.')
+    r.ImGui_Separator(ctx)
+    if r.HB_Pot_CrawlerIsRecording() == 0 then
+      if r.ImGui_Button(ctx, 'Back') then crawler.step = 'rec_next' end
+      if done then
+        r.ImGui_SameLine(ctx)
+        if r.ImGui_Button(ctx, 'Start crawling') then crawler_start_crawl() end
+      end
     end
   elseif step == 'crawling' then
     r.ImGui_Text(ctx, 'Crawling... press Escape (over the plug-in) to stop.')

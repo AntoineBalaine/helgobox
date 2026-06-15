@@ -1339,15 +1339,11 @@ unsafe extern "C" fn vararg_HB_Pot_IsFocusedFxOpenFloating(
 // ---------------------------------------------------------------------------
 
 extern "C" fn HB_Pot_CrawlerStart(
-    next_x: c_int,
-    next_y: c_int,
     stop_if_destination_exists: c_int,
     never_stop: c_int,
     use_save_as: c_int,
 ) -> c_int {
     crate::crawler::start(
-        next_x,
-        next_y,
         stop_if_destination_exists != 0,
         never_stop != 0,
         use_save_as != 0,
@@ -1358,19 +1354,17 @@ unsafe extern "C" fn vararg_HB_Pot_CrawlerStart(args: *mut *mut c_void, n: c_int
         int_arg(args, n, 0),
         int_arg(args, n, 1),
         int_arg(args, n, 2),
-        int_arg(args, n, 3),
-        int_arg(args, n, 4),
     ))
 }
 
-extern "C" fn HB_Pot_CrawlerRecordStart() {
-    crate::crawler::record_start();
+extern "C" fn HB_Pot_CrawlerRecordStart(target: c_int) {
+    crate::crawler::record_start(target);
 }
 unsafe extern "C" fn vararg_HB_Pot_CrawlerRecordStart(
-    _: *mut *mut c_void,
-    _: c_int,
+    args: *mut *mut c_void,
+    n: c_int,
 ) -> *mut c_void {
-    HB_Pot_CrawlerRecordStart();
+    HB_Pot_CrawlerRecordStart(int_arg(args, n, 0));
     std::ptr::null_mut()
 }
 
@@ -1395,14 +1389,14 @@ unsafe extern "C" fn vararg_HB_Pot_CrawlerIsRecording(
     ret_int(HB_Pot_CrawlerIsRecording())
 }
 
-extern "C" fn HB_Pot_CrawlerRecordedEventCount() -> c_int {
-    crate::crawler::recorded_event_count()
+extern "C" fn HB_Pot_CrawlerRecordedCount(target: c_int) -> c_int {
+    crate::crawler::recorded_count(target)
 }
-unsafe extern "C" fn vararg_HB_Pot_CrawlerRecordedEventCount(
-    _: *mut *mut c_void,
-    _: c_int,
+unsafe extern "C" fn vararg_HB_Pot_CrawlerRecordedCount(
+    args: *mut *mut c_void,
+    n: c_int,
 ) -> *mut c_void {
-    ret_int(HB_Pot_CrawlerRecordedEventCount())
+    ret_int(HB_Pot_CrawlerRecordedCount(int_arg(args, n, 0)))
 }
 
 extern "C" fn HB_Pot_CrawlerPhase() -> c_int {
@@ -1735,7 +1729,7 @@ macro_rules! paste_vararg {
     (HB_Pot_CrawlerRecordStart) => { vararg_HB_Pot_CrawlerRecordStart };
     (HB_Pot_CrawlerRecordStop) => { vararg_HB_Pot_CrawlerRecordStop };
     (HB_Pot_CrawlerIsRecording) => { vararg_HB_Pot_CrawlerIsRecording };
-    (HB_Pot_CrawlerRecordedEventCount) => { vararg_HB_Pot_CrawlerRecordedEventCount };
+    (HB_Pot_CrawlerRecordedCount) => { vararg_HB_Pot_CrawlerRecordedCount };
     (HB_Pot_RecorderPrepare) => { vararg_HB_Pot_RecorderPrepare };
     (HB_Pot_RecorderPhase) => { vararg_HB_Pot_RecorderPhase };
     (HB_Pot_RecorderIsRunning) => { vararg_HB_Pot_RecorderIsRunning };
@@ -1877,15 +1871,15 @@ fn pot_api_fns() -> Vec<PotApiFn> {
         HB_Pot_IsFocusedFxOpenFloating:
             b"int\0\0\0Returns 1 if there is a focused FX and it is open in a floating window (a precondition for the preset crawler).\0";
         HB_Pot_CrawlerStart:
-            b"int\0int,int,int,int,int\0next_x,next_y,stop_if_destination_exists,never_stop,use_save_as\0Starts crawling the focused FX (must be open in a floating window). next_x/next_y: screen position of the plug-in's \"Next preset\" button. If use_save_as is 1, preset names are scraped by replaying the recorded save-as macro (record it first with HB_Pot_CrawlerRecordStart/Stop); otherwise names come from the host API. Returns 1 if started, 0 otherwise (e.g. save-as mode with no recorded macro).\0";
+            b"int\0int,int,int\0stop_if_destination_exists,never_stop,use_save_as\0Starts crawling the focused FX (must be open in a floating window). Requires a recorded Next-preset macro (HB_Pot_CrawlerRecordStart(0)/Stop). If use_save_as is 1, preset names are scraped by replaying the recorded save-as macro (record with target 1); otherwise names come from the host API. Returns 1 if started, 0 otherwise (e.g. missing recorded macro).\0";
         HB_Pot_CrawlerRecordStart:
-            b"void\0\0\0Starts recording the \"Save Preset As\" action sequence (clicks + keystrokes) on a background thread. Demonstrate the flow on the plug-in, then press Escape (or call HB_Pot_CrawlerRecordStop) to finish.\0";
+            b"void\0int\0target\0Starts recording an action sequence (clicks + keystrokes) on a background thread. target: 0 = the \"Next preset\" click, 1 = the \"Save Preset As\" name-grab. Demonstrate it on the plug-in, then press Escape (or call HB_Pot_CrawlerRecordStop) to finish.\0";
         HB_Pot_CrawlerRecordStop:
-            b"void\0\0\0Stops recording the save-as action sequence and stores it for the next crawl.\0";
+            b"void\0\0\0Stops the current action recording and stores it for the next crawl.\0";
         HB_Pot_CrawlerIsRecording:
-            b"int\0\0\0Returns 1 while a save-as action recording is in progress (0 once Escape is pressed or it is stopped).\0";
-        HB_Pot_CrawlerRecordedEventCount:
-            b"int\0\0\0Returns the number of recorded save-as actions captured so far (or in the stored macro once recording stopped).\0";
+            b"int\0\0\0Returns 1 while an action recording is in progress (0 once Escape is pressed or it is stopped).\0";
+        HB_Pot_CrawlerRecordedCount:
+            b"int\0int\0target\0Returns the number of recorded actions for the given target (0 = next-preset, 1 = save-as): the live count while recording, otherwise the stored macro's length.\0";
         HB_Pot_CrawlerPhase:
             b"int\0\0\0Returns the crawler phase: 0=idle, 1=crawling, 2=stopped (ready to import/discard), 3=importing, 4=done, 5=failed.\0";
         HB_Pot_CrawlerIsRunning:
