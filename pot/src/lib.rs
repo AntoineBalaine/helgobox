@@ -839,6 +839,16 @@ impl RuntimePotUnit {
     ) -> Result<Fx, LoadPresetError> {
         let _ = self.sound_player.stop();
         let protected_fx = self.protected_fx().clone();
+        let kind_label = match &preset.kind {
+            PotPresetKind::FileBased(k) => format!("FileBased({})", k.path),
+            PotPresetKind::ProjectBased(_) => "ProjectBased(rfxchain)".to_string(),
+            PotPresetKind::Internal(k) => format!("Internal(plugin_id={:?})", k.plugin_id),
+            PotPresetKind::DefaultFactory(id) => format!("DefaultFactory({id:?})"),
+        };
+        eprintln!(
+            "[pot-load] load preset {:?} kind={kind_label}",
+            preset.name()
+        );
         let outcome = match &preset.kind {
             PotPresetKind::FileBased(k) => self.load_file_based_preset(
                 &k.path,
@@ -1758,7 +1768,16 @@ fn ensure_fx_has_correct_type(
             // No need to fall back to chunk-based FX info because Pot is experimental, and we can assume it's used
             // with recent REAPER versions.
             let fx_info = fx.info()?;
-            if fx_info.id == plugin_id.content_formatted_for_reaper() {
+            let wanted = plugin_id.content_formatted_for_reaper();
+            eprintln!(
+                "[pot-load] ensure_fx_has_correct_type: existing fx id={:?} name={:?} index={} | \
+                 preset plugin_id={plugin_id:?} formatted={wanted:?} | match={}",
+                fx_info.id,
+                fx_info.effect_name,
+                destination.fx_index,
+                fx_info.id == wanted,
+            );
+            if fx_info.id == wanted {
                 // This is the right plug-in type. Leave as is.
                 FxEnsureOutput {
                     fx,
@@ -1769,8 +1788,14 @@ fn ensure_fx_has_correct_type(
                 if &fx == protected_fx {
                     return Err(CANT_REMOVE_PROTECTED_FX.into());
                 }
+                eprintln!(
+                    "[pot-load] type mismatch -> removing existing fx {:?} and inserting preset plugin",
+                    fx_info.effect_name
+                );
                 destination.chain.remove_fx(&fx)?;
-                let fx = insert_fx_by_plugin_id(plugin_id, destination)?;
+                let fx = insert_fx_by_plugin_id(plugin_id, destination).inspect_err(|e| {
+                    eprintln!("[pot-load] re-insert FAILED after removal: {e} (slot now empty!)");
+                })?;
                 FxEnsureOutput {
                     fx,
                     op: FxEnsureOp::Replaced,
