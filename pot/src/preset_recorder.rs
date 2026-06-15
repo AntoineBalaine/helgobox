@@ -29,6 +29,9 @@ use xcap::Window;
 
 const POLL_INTERVAL: Duration = Duration::from_millis(3);
 const MAX_RECORD: Duration = Duration::from_secs(120);
+/// Max gap + distance for consecutive clicks to count as one multi-click sequence.
+const MULTI_CLICK_INTERVAL: Duration = Duration::from_millis(500);
+const MULTI_CLICK_DIST: i32 = 6;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ClickButton {
@@ -48,6 +51,11 @@ pub enum InputEvent {
         off_y: i32,
         abs_x: i32,
         abs_y: i32,
+        /// Multi-click count (1 = single, 2 = double, 3 = triple, ...), detected from
+        /// timing+position at record time. On macOS this becomes the event's click-state so
+        /// a recorded triple-click replays as a real triple-click (needed to select text in
+        /// native dialogs); elsewhere replay timing reproduces it.
+        clicks: u8,
         delay_ms: u64,
     },
     KeyDown {
@@ -148,6 +156,8 @@ fn record_loop(stop: Arc<AtomicBool>, running: Arc<AtomicBool>, events: Arc<Mute
     let mut prev_left = false;
     let mut prev_right = false;
     let mut prev_keys: HashSet<Keycode> = HashSet::new();
+    // Tracks the previous click for multi-click detection: (time, x, y, count).
+    let mut last_click: Option<(Instant, i32, i32, u8)> = None;
 
     loop {
         if stop.load(Ordering::Relaxed) || start.elapsed() > MAX_RECORD {
@@ -166,8 +176,20 @@ fn record_loop(stop: Arc<AtomicBool>, running: Arc<AtomicBool>, events: Arc<Mute
             None
         };
         if let Some(button) = clicked {
+            let now = Instant::now();
+            let clicks = match last_click {
+                Some((t, lx, ly, c))
+                    if now.duration_since(t) < MULTI_CLICK_INTERVAL
+                        && (x - lx).abs() <= MULTI_CLICK_DIST
+                        && (y - ly).abs() <= MULTI_CLICK_DIST =>
+                {
+                    c.saturating_add(1)
+                }
+                _ => 1,
+            };
+            last_click = Some((now, x, y, clicks));
             let delay_ms = stamp(&mut last_event);
-            let ev = resolve_click(button, x, y, delay_ms);
+            let ev = resolve_click(button, x, y, clicks, delay_ms);
             if let Ok(mut e) = events.lock() {
                 e.push(ev);
             }
@@ -203,7 +225,7 @@ fn record_loop(stop: Arc<AtomicBool>, running: Arc<AtomicBool>, events: Arc<Mute
     running.store(false, Ordering::Relaxed);
 }
 
-fn resolve_click(button: ClickButton, x: i32, y: i32, delay_ms: u64) -> InputEvent {
+fn resolve_click(button: ClickButton, x: i32, y: i32, clicks: u8, delay_ms: u64) -> InputEvent {
     let (win_id, off_x, off_y) = topmost_window_at(x, y)
         .map(|w| (w.id(), x - w.x(), y - w.y()))
         .unwrap_or((0, 0, 0));
@@ -214,6 +236,7 @@ fn resolve_click(button: ClickButton, x: i32, y: i32, delay_ms: u64) -> InputEve
         off_y,
         abs_x: x,
         abs_y: y,
+        clicks,
         delay_ms,
     }
 }

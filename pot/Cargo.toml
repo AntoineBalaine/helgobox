@@ -54,3 +54,9 @@ camino.workspace = true
 
 [lints.clippy]
 enum_glob_use = "deny"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+# Posting mouse clicks with the multi-click "click state" macOS needs to recognize
+# double/triple-clicks (enigo always posts click-state 1). Used by the save-as macro
+# replay so a recorded triple-click selects text in native dialogs.
+core-graphics = "0.24"

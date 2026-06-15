@@ -465,6 +465,41 @@ fn resolve_click_target(
     }
 }
 
+/// Posts a mouse click at `(x, y)` carrying the macOS multi-click state (1=single,
+/// 2=double, 3=triple). enigo always posts click-state 1, so a recorded triple-click would
+/// otherwise replay as three single clicks and never select text in a native dialog.
+#[cfg(target_os = "macos")]
+fn synth_click_macos(x: i32, y: i32, button: ClickButton, clicks: u8) {
+    use core_graphics::event::{
+        CGEvent, CGEventTapLocation, CGEventType, CGMouseButton, EventField,
+    };
+    use core_graphics::event_source::{CGEventSource, CGEventSourceStateID};
+    use core_graphics::geometry::CGPoint;
+    let Ok(source) = CGEventSource::new(CGEventSourceStateID::CombinedSessionState) else {
+        return;
+    };
+    let (down_type, up_type, btn) = match button {
+        ClickButton::Left => (
+            CGEventType::LeftMouseDown,
+            CGEventType::LeftMouseUp,
+            CGMouseButton::Left,
+        ),
+        ClickButton::Right => (
+            CGEventType::RightMouseDown,
+            CGEventType::RightMouseUp,
+            CGMouseButton::Right,
+        ),
+    };
+    let point = CGPoint::new(x as f64, y as f64);
+    for event_type in [down_type, up_type] {
+        if let Ok(event) = CGEvent::new_mouse_event(source.clone(), event_type, point, btn) {
+            event.set_integer_value_field(EventField::MOUSE_EVENT_CLICK_STATE, clicks as i64);
+            event.post(CGEventTapLocation::HID);
+        }
+        std::thread::sleep(Duration::from_millis(2));
+    }
+}
+
 /// Replays a recorded action macro. Returns `Ok(false)` if the user pressed Escape.
 ///
 /// Clicks are resolved/verified by [`resolve_click_target`]; keys replay by physical
@@ -488,6 +523,7 @@ async fn replay_macro(
                 off_y,
                 abs_x,
                 abs_y,
+                clicks,
                 delay_ms,
             } => {
                 millis((*delay_ms).min(5000)).await;
@@ -495,13 +531,24 @@ async fn replay_macro(
                 let pos = MouseCursorPosition::new(tx.max(0) as u32, ty.max(0) as u32);
                 mouse.set_cursor_position(pos)?;
                 millis(12).await;
-                let b = match button {
-                    ClickButton::Left => MouseButton::Left,
-                    ClickButton::Right => MouseButton::Right,
-                };
-                mouse.press(b)?;
-                millis(12).await;
-                mouse.release(b)?;
+                // On macOS the click must carry the multi-click state so the OS treats a
+                // recorded triple-click as a triple-click (enigo can't set it); elsewhere a
+                // plain click with the recorded timing suffices.
+                #[cfg(target_os = "macos")]
+                {
+                    synth_click_macos(tx, ty, *button, *clicks);
+                }
+                #[cfg(not(target_os = "macos"))]
+                {
+                    let _ = clicks;
+                    let b = match button {
+                        ClickButton::Left => MouseButton::Left,
+                        ClickButton::Right => MouseButton::Right,
+                    };
+                    mouse.press(b)?;
+                    millis(12).await;
+                    mouse.release(b)?;
+                }
             }
             InputEvent::KeyDown { raw, delay_ms } => {
                 millis((*delay_ms).min(5000)).await;
