@@ -191,11 +191,56 @@ no mtime/size cache and no persistence.
 
 ## Save-as name capture: window-relative action recorder (supersedes fixed positions)
 
-**Implemented (commit 429eb0e3).** Recorder in `pot/src/preset_recorder.rs`; replay +
-verify-before-click in `pot/src/preset_crawler.rs` (`save_as_macro` on `CrawlPresetArgs`,
-takes precedence over the kept-for-egui `save_as_dialog`); `HB_Pot_CrawlerRecord*` API in
-`pot-api`; "record save-as actions" step in the Lua crawler wizard. macOS + Linux/X11
-keycode tables; physical-position replay via `enigo::Key::Raw`. Not yet run inside REAPER.
+**Implemented and working in REAPER on macOS (Serum verified).** The sections below capture
+the original plan/PoC; this note is the authoritative current state.
+
+### What shipped
+
+The crawler is now driven entirely by **recorded action macros** replayed per preset, and
+saves **native REAPER FX presets** rather than `.RfxChain` files.
+
+- **Recorder** (`pot/src/preset_recorder.rs`): a background `device_query` poll thread
+  captures clicks (stored window-relative: the xcap window id under the cursor + offset,
+  with an absolute fallback) and keystrokes (stored as the platform raw keycode). It also
+  records the **multi-click count** (timing+position) so a triple-click can replay as a real
+  triple-click. Recording **stops via the UI button** (not Escape — Escape closed the FX
+  window and is now ignored and never recorded). The trailing click (the user clicking
+  "Stop") is dropped from the macro.
+- **Replay** (`pot/src/preset_crawler.rs`): clicks are **verified before firing** — the
+  recorded window is re-resolved and must be the topmost window at the target point, else
+  the crawl aborts rather than click the wrong window. A click whose window is **gone**
+  (a transient dialog/menu that reopened with a new id) falls back to its recorded absolute
+  position. Keys replay by **physical position** (`enigo::Key::Raw`) so they're
+  layout-independent (bépo etc.); on macOS clicks are posted via **core-graphics** carrying
+  the multi-click state (enigo only ever posts click-state 1). Timing reproduces the
+  recorded inter-event delays (capped), so triple-clicks and dialog waits replay correctly.
+- **Three macros** (`CrawlPresetArgs`: `next_preset_macro`, `save_as_macro`,
+  `save_preset_macro`): (1) Next-preset click, (2) Scrape-name — plug-in Save-As ->
+  triple-click -> copy -> cancel — only when the plug-in hides names, (3) Save-preset —
+  REAPER's "+" -> Save preset -> triple-click -> paste -> Save. The crawl loop: advance ->
+  read the scraped name (clipboard) for dedup/end-of-list detection -> if new, replay the
+  save-preset macro. The clipboard bridges scrape -> paste. **No FX chunk capture, no
+  `.RfxChain`, no Import/Discard step.** The chunk/`.RfxChain` path stays for the egui
+  browser (which passes all three macro fields as `None`).
+- **API** (`pot-api`): `HB_Pot_CrawlerRecordStart(target)` (0=next, 1=scrape, 2=save-preset),
+  `RecordStop`, `IsRecording`, `RecordedCount(target)`; `CrawlerStart(stop_if_dest,
+  never_stop, use_save_as)` uses whichever macros are stored. Macros stay in Rust.
+- **Lua wizard**: a single setup screen with three independently re-recordable sections,
+  each a red `● Record` / `■ Stop recording` button + status; "Start crawling" enables when
+  the required macros are captured; post-crawl shows a native summary (no import).
+
+Validated first in a standalone PoC (`pot-input-poc/`), then in REAPER.
+
+### Open items / known limitations
+- **Transient-dialog position drift:** clicks inside a dialog that reopens with a new window
+  id replay by *absolute* position, so they miss if the dialog reopens at a different spot
+  (suspected on Serum's native save-panel Cancel button). Fix if confirmed: anchor such
+  clicks to the current topmost window (the reopened dialog) + recorded offset.
+- **Replay speed:** the per-action delays are the *recorded* inter-event timings, so the
+  replay runs at the pace the macro was recorded at — brisk recording = fast crawl. A speed
+  factor / lower delay cap could trim long human pauses (watch dialog-appearance waits).
+- **macOS click-state path** is `cfg`-gated (core-graphics), so it's only compiled/verified
+  on the Mac, not by the Linux `cargo check`.
 
 ### Why the current model is wrong
 The upstream crawler scrapes a preset's name from the plug-in's "Save Preset As" dialog
