@@ -1405,9 +1405,10 @@ fn process_dialogs(input: ProcessDialogsInput, ctx: &Context) {
                         },
                         // The egui browser uses the fixed Next-preset position and
                         // fixed-position scraping, not recorded macros (the standalone/Lua
-                        // path).
+                        // path), and saves as RfxChain rather than native presets.
                         next_preset_macro: None,
                         save_as_macro: None,
+                        save_preset_macro: None,
                         bring_focus_back_to_crawler: move || {
                             os_window.focus_first_child();
                         },

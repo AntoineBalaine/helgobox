@@ -1873,13 +1873,13 @@ fn pot_api_fns() -> Vec<PotApiFn> {
         HB_Pot_CrawlerStart:
             b"int\0int,int,int\0stop_if_destination_exists,never_stop,use_save_as\0Starts crawling the focused FX (must be open in a floating window). Requires a recorded Next-preset macro (HB_Pot_CrawlerRecordStart(0)/Stop). If use_save_as is 1, preset names are scraped by replaying the recorded save-as macro (record with target 1); otherwise names come from the host API. Returns 1 if started, 0 otherwise (e.g. missing recorded macro).\0";
         HB_Pot_CrawlerRecordStart:
-            b"void\0int\0target\0Starts recording an action sequence (clicks + keystrokes) on a background thread. target: 0 = the \"Next preset\" click, 1 = the \"Save Preset As\" name-grab. Demonstrate it on the plug-in, then press Escape (or call HB_Pot_CrawlerRecordStop) to finish.\0";
+            b"void\0int\0target\0Starts recording an action sequence (clicks + keystrokes) on a background thread. target: 0 = the \"Next preset\" click, 1 = the \"Save Preset As\" name-grab, 2 = REAPER's \"Save preset\" (for saving native FX presets). Demonstrate it, then press Escape (or call HB_Pot_CrawlerRecordStop) to finish.\0";
         HB_Pot_CrawlerRecordStop:
             b"void\0\0\0Stops the current action recording and stores it for the next crawl.\0";
         HB_Pot_CrawlerIsRecording:
             b"int\0\0\0Returns 1 while an action recording is in progress (0 once Escape is pressed or it is stopped).\0";
         HB_Pot_CrawlerRecordedCount:
-            b"int\0int\0target\0Returns the number of recorded actions for the given target (0 = next-preset, 1 = save-as): the live count while recording, otherwise the stored macro's length.\0";
+            b"int\0int\0target\0Returns the number of recorded actions for the given target (0 = next-preset, 1 = scrape-name, 2 = save-preset): the live count while recording, otherwise the stored macro's length.\0";
         HB_Pot_CrawlerPhase:
             b"int\0\0\0Returns the crawler phase: 0=idle, 1=crawling, 2=stopped (ready to import/discard), 3=importing, 4=done, 5=failed.\0";
         HB_Pot_CrawlerIsRunning:

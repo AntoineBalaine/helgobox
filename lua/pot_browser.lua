@@ -60,11 +60,12 @@ local filter_search_state = {}
 -- {next-preset, save-as button, cancel button}.
 local crawler = {
   open = false,
-  step = 'intro',
+  step = 'setup',
   stop_if_dest = false,
   never_stop = false,
   use_save_as = false,
   recording_started = false,
+  recording_target = nil,
 }
 
 -- Preview Recorder wizard state. `step`: intro | preparing | ready | recording | done
@@ -611,7 +612,7 @@ local function toolbar()
     r.ImGui_SameLine(ctx)
     if r.ImGui_Button(ctx, 'Crawler') then
       crawler.open = true
-      crawler.step = 'intro'
+      crawler.step = 'setup'
     end
   end
   -- Preview Recorder (only when the standalone extension exposes the recorder API).
@@ -633,35 +634,43 @@ local function crawler_close()
   crawler.open = false
 end
 
--- Record button + RECORDING indicator, classic red studio styling. `target`: 0 = next-
--- preset, 1 = save-as. `what` describes the action for the prompt. Returns true once a
--- macro with at least one event has been recorded for this target.
-local function crawler_record_ui(target, what)
-  if r.HB_Pot_CrawlerIsRecording() ~= 0 then
-    local count = r.HB_Pot_CrawlerRecordedCount(target)
-    r.ImGui_TextColored(ctx, 0xFF3030FF, string.format('\u{25CF} RECORDING   %d actions', count))
-    r.ImGui_TextWrapped(ctx, 'On the plug-in: ' .. what .. '   Then press ESC to finish.')
-    return false
-  end
-  -- Recording just ended (ESC) -> finalize and store the macro.
-  if crawler.recording_started then
+-- One inline record section: header, status line, and a red Record button (classic studio
+-- styling). `target`: 0 = next-preset, 1 = scrape-name, 2 = save-preset. Re-recordable
+-- independently; the red RECORDING indicator shows only for the section being recorded, and
+-- the other sections' buttons are disabled while one is recording.
+local function crawler_record_ui(target, label, what)
+  local recording = r.HB_Pot_CrawlerIsRecording() ~= 0
+  -- Finalize when THIS section's recording has just ended (ESC).
+  if crawler.recording_target == target and not recording and crawler.recording_started then
     r.HB_Pot_CrawlerRecordStop()
     crawler.recording_started = false
+    crawler.recording_target = nil
   end
   local count = r.HB_Pot_CrawlerRecordedCount(target)
-  if count > 0 then
-    r.ImGui_Text(ctx, string.format('Recorded %d actions.', count))
+  r.ImGui_Text(ctx, label)
+  if recording and crawler.recording_target == target then
+    r.ImGui_TextColored(ctx, 0xFF3030FF, string.format('  \u{25CF} RECORDING  %d actions', count))
+    r.ImGui_TextWrapped(ctx, '  ' .. what .. '   Then press ESC.')
+    return
   end
+  if count > 0 then
+    r.ImGui_TextDisabled(ctx, string.format('  recorded %d actions', count))
+  else
+    r.ImGui_TextDisabled(ctx, '  not recorded yet')
+  end
+  if recording then r.ImGui_BeginDisabled(ctx) end
   r.ImGui_PushStyleColor(ctx, r.ImGui_Col_Button(), 0xB02828FF)
   r.ImGui_PushStyleColor(ctx, r.ImGui_Col_ButtonHovered(), 0xD03838FF)
   r.ImGui_PushStyleColor(ctx, r.ImGui_Col_ButtonActive(), 0xF04848FF)
-  local pressed = r.ImGui_Button(ctx, count > 0 and '\u{25CF} Re-record' or '\u{25CF} Record')
+  local pressed = r.ImGui_Button(ctx,
+    (count > 0 and '\u{25CF} Re-record##rec' or '\u{25CF} Record##rec') .. target)
   r.ImGui_PopStyleColor(ctx, 3)
+  if recording then r.ImGui_EndDisabled(ctx) end
   if pressed then
     r.HB_Pot_CrawlerRecordStart(target)
     crawler.recording_started = true
+    crawler.recording_target = target
   end
-  return count > 0
 end
 
 local function crawler_start_crawl()
@@ -673,18 +682,17 @@ end
 
 local function crawler_render()
   if not crawler.open then return end
-  r.ImGui_SetNextWindowSize(ctx, 480, 340, r.ImGui_Cond_FirstUseEver())
+  r.ImGui_SetNextWindowSize(ctx, 500, 540, r.ImGui_Cond_FirstUseEver())
   local visible, open = r.ImGui_Begin(ctx, 'Preset Crawler', true)
   if not open then crawler.open = false end
   if not visible then return end
 
   local step = crawler.step
-  if step == 'intro' then
+  if step == 'setup' then
     r.ImGui_TextWrapped(ctx,
-      'The crawler steps a plug-in through its presets, saving each as an FX chain. Open the '
-      .. 'plug-in in a FLOATING FX window first. You record the "Next preset" click (and, if '
-      .. 'the plug-in hides its names, the "Save Preset As" name-grab) once; the crawler '
-      .. 'replays them per preset.')
+      'Open the plug-in in a FLOATING FX window. Record each action once with the red '
+      .. 'buttons; the crawler replays them per preset, saving each as a native REAPER FX '
+      .. 'preset. Re-record any step as needed.')
     r.ImGui_Separator(ctx)
     local fxok, fxname = r.HB_Pot_GetFocusedFxName()
     local floating = r.HB_Pot_IsFocusedFxOpenFloating() ~= 0
@@ -696,51 +704,34 @@ local function crawler_render()
     if not floating then
       r.ImGui_TextColored(ctx, 0xFF6060FF, 'The focused FX must be open in a floating window.')
     end
-    r.ImGui_Separator(ctx)
-    local c1, v1 = r.ImGui_Checkbox(ctx, 'Stop if a destination file already exists', crawler.stop_if_dest)
+    local c1, v1 = r.ImGui_Checkbox(ctx, 'Stop if a destination already exists', crawler.stop_if_dest)
     if c1 then crawler.stop_if_dest = v1 end
     local c2, v2 = r.ImGui_Checkbox(ctx, 'Never stop automatically (crawl until Escape)', crawler.never_stop)
     if c2 then crawler.never_stop = v2 end
-    local c3, v3 = r.ImGui_Checkbox(ctx, 'Scrape names from the "Save Preset As" dialog', crawler.use_save_as)
+    local c3, v3 = r.ImGui_Checkbox(ctx, 'Plug-in hides names: scrape from "Save Preset As"', crawler.use_save_as)
     if c3 then crawler.use_save_as = v3 end
     r.ImGui_Separator(ctx)
-    if r.ImGui_Button(ctx, 'Cancel') then crawler.open = false end
+    crawler_record_ui(0, '1. Next-preset click',
+      'Click the plug-in\'s "Next preset" button.')
+    if crawler.use_save_as then
+      r.ImGui_Separator(ctx)
+      crawler_record_ui(1, '2. Scrape preset name',
+        'Open Save As, triple-click the name, copy (Cmd/Ctrl+C or right-click -> Copy), Cancel.')
+    end
+    r.ImGui_Separator(ctx)
+    crawler_record_ui(2, '3. Save as REAPER preset',
+      'Click "+", "Save preset", triple-click the name field, paste (Cmd/Ctrl+V), Save.')
+    r.ImGui_Separator(ctx)
+    local recording = r.HB_Pot_CrawlerIsRecording() ~= 0
+    local ready = (not recording) and floating
+      and r.HB_Pot_CrawlerRecordedCount(0) > 0
+      and r.HB_Pot_CrawlerRecordedCount(2) > 0
+      and (not crawler.use_save_as or r.HB_Pot_CrawlerRecordedCount(1) > 0)
+    if r.ImGui_Button(ctx, 'Cancel') then crawler_close() end
     r.ImGui_SameLine(ctx)
-    if not floating then r.ImGui_BeginDisabled(ctx) end
-    if r.ImGui_Button(ctx, 'Begin: record Next-preset') then crawler.step = 'rec_next' end
-    if not floating then r.ImGui_EndDisabled(ctx) end
-  elseif step == 'rec_next' then
-    r.ImGui_TextWrapped(ctx, 'Record the "Next preset" click: hit Record, click the plug-in\'s '
-      .. 'Next-preset button, then press ESC.')
-    r.ImGui_Separator(ctx)
-    local done = crawler_record_ui(0, 'click the "Next preset" button.')
-    r.ImGui_Separator(ctx)
-    if r.HB_Pot_CrawlerIsRecording() == 0 then
-      if r.ImGui_Button(ctx, 'Cancel') then crawler_close() end
-      if done then
-        r.ImGui_SameLine(ctx)
-        if crawler.use_save_as then
-          if r.ImGui_Button(ctx, 'Next: record Save-As') then crawler.step = 'rec_saveas' end
-        else
-          if r.ImGui_Button(ctx, 'Start crawling') then crawler_start_crawl() end
-        end
-      end
-    end
-  elseif step == 'rec_saveas' then
-    r.ImGui_TextWrapped(ctx, 'Record the "Save Preset As" name-grab. It replays per preset to '
-      .. 'read each name.')
-    r.ImGui_Separator(ctx)
-    local done = crawler_record_ui(1,
-      'open Save As, select the name (triple-click the field), copy it (Cmd/Ctrl+C or '
-      .. 'right-click -> Copy), then Cancel.')
-    r.ImGui_Separator(ctx)
-    if r.HB_Pot_CrawlerIsRecording() == 0 then
-      if r.ImGui_Button(ctx, 'Back') then crawler.step = 'rec_next' end
-      if done then
-        r.ImGui_SameLine(ctx)
-        if r.ImGui_Button(ctx, 'Start crawling') then crawler_start_crawl() end
-      end
-    end
+    if not ready then r.ImGui_BeginDisabled(ctx) end
+    if r.ImGui_Button(ctx, 'Start crawling') then crawler_start_crawl() end
+    if not ready then r.ImGui_EndDisabled(ctx) end
   elseif step == 'crawling' then
     r.ImGui_Text(ctx, 'Crawling... press Escape (over the plug-in) to stop.')
     r.ImGui_Separator(ctx)
@@ -752,22 +743,11 @@ local function crawler_render()
     if phase == 2 then crawler.step = 'stopped'
     elseif phase == 5 then crawler.step = 'failed' end
   elseif step == 'stopped' then
-    r.ImGui_Text(ctx, string.format('Crawled %d presets.', r.HB_Pot_CrawlerCrawledCount()))
+    r.ImGui_Text(ctx, string.format('Done. Saved %d preset(s) as native REAPER presets.',
+      r.HB_Pot_CrawlerCrawledCount()))
     local sok, slabel = r.HB_Pot_CrawlerStopReasonLabel()
     if sok ~= 0 and slabel ~= '' then r.ImGui_TextWrapped(ctx, slabel) end
     r.ImGui_Separator(ctx)
-    if r.ImGui_Button(ctx, 'Import') then
-      crawler.step = (r.HB_Pot_CrawlerImport() ~= 0) and 'importing' or 'failed'
-    end
-    r.ImGui_SameLine(ctx)
-    if r.ImGui_Button(ctx, 'Discard') then crawler_close() end
-  elseif step == 'importing' then
-    r.ImGui_Text(ctx, 'Importing crawled presets...')
-    local phase = r.HB_Pot_CrawlerPhase()
-    if phase == 4 then crawler.step = 'done'
-    elseif phase == 5 then crawler.step = 'failed' end
-  elseif step == 'done' then
-    r.ImGui_Text(ctx, string.format('Imported %d presets.', r.HB_Pot_CrawlerCrawledCount()))
     if r.ImGui_Button(ctx, 'Close') then crawler_close() end
   elseif step == 'failed' then
     r.ImGui_TextColored(ctx, 0xFF6060FF, 'Crawler failed or was cancelled.')

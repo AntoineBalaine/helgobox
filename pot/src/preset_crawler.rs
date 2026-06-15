@@ -229,6 +229,10 @@ pub struct CrawlPresetArgs<F> {
     /// keystrokes) instead of the fixed two-position `save_as_dialog`. Takes precedence
     /// over `save_as_dialog` when both are set. See [`crate::preset_recorder`].
     pub save_as_macro: Option<RecordedMacro>,
+    /// If set, presets are saved as native REAPER FX presets by replaying this recorded
+    /// macro (REAPER's "+" -> "Save preset" -> paste name -> save) per new preset, instead
+    /// of capturing FX chunks into `.RfxChain` files. No import step is needed.
+    pub save_preset_macro: Option<RecordedMacro>,
     pub bring_focus_back_to_crawler: F,
 }
 
@@ -296,8 +300,41 @@ where
                 ));
             }
         };
-        {
-            // Query chunk and save it in temporary file
+        if let Some(save_macro) = &args.save_preset_macro {
+            // Native-preset mode: dedup / detect end-of-list by NAME *before* saving, so a
+            // wrap-around duplicate is never re-saved (which could trip REAPER's "overwrite?"
+            // prompt). Only genuinely new presets are saved, by replaying the recorded "Save
+            // preset" macro (which pastes the name from the clipboard into REAPER's
+            // Save-preset dialog). No FX chunk is captured and there's no import step.
+            let dummy = CrawledPreset {
+                name: name.clone(),
+                offset: 0,
+                size_in_bytes: 0,
+                destination: Utf8PathBuf::new(),
+            };
+            let before = blocking_lock_arc(&args.state, "crawl native 1").preset_count();
+            let next_step = blocking_lock_arc(&args.state, "crawl native 2")
+                .add_preset(dummy, args.never_stop_crawling);
+            if let NextCrawlStep::Stop(reason) = next_step {
+                return Ok(PresetCrawlingOutcome::new(chunks_file, reason));
+            }
+            let is_new = blocking_lock_arc(&args.state, "crawl native 3").preset_count() > before;
+            if is_new {
+                // The save macro pastes the name from the clipboard. After a name scrape it's
+                // already there; for host-provided names, put it there now.
+                if args.save_as_macro.is_none() && args.save_as_dialog.is_none() {
+                    set_clipboard_text(&name)?;
+                }
+                args.fx.show_in_floating_window()?;
+                if !replay_macro(&mut mouse, save_macro, &escape_catcher).await? {
+                    return Ok(PresetCrawlingOutcome::new(
+                        chunks_file,
+                        PresetCrawlerStopReason::Interrupted,
+                    ));
+                }
+            }
+        } else {
+            // Chunk / RfxChain mode (the egui browser path).
             let fx_chunk = args.fx.chunk()?;
             let fx_chunk_content = fx_chunk.content();
             let fx_chunk_bytes = fx_chunk_content.as_bytes();

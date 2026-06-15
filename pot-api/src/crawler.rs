@@ -51,8 +51,20 @@ thread_local! {
     static NEXT_PRESET_MACRO: RefCell<Option<RecordedMacro>> = const { RefCell::new(None) };
     /// Recorded "Save Preset As" name-grab macro (used when scraping names).
     static SAVE_AS_MACRO: RefCell<Option<RecordedMacro>> = const { RefCell::new(None) };
-    /// Which macro the in-progress recording is for: 0 = next-preset, 1 = save-as.
+    /// Recorded "Save preset" macro (REAPER's +/Save preset, for native-preset saving).
+    static SAVE_PRESET_MACRO: RefCell<Option<RecordedMacro>> = const { RefCell::new(None) };
+    /// Which macro the in-progress recording is for: 0 = next-preset, 1 = scrape-name,
+    /// 2 = save-preset.
     static RECORD_TARGET: RefCell<i32> = const { RefCell::new(0) };
+}
+
+fn macro_slot_len(target: i32) -> usize {
+    let slot = match target {
+        1 => &SAVE_AS_MACRO,
+        2 => &SAVE_PRESET_MACRO,
+        _ => &NEXT_PRESET_MACRO,
+    };
+    slot.with(|m| m.borrow().as_ref().map(|e| e.len()).unwrap_or(0))
 }
 
 // --- Action recording (delegates to pot::preset_recorder) ---
@@ -69,10 +81,10 @@ pub fn record_start(target: i32) {
 pub fn record_stop() {
     reaper_low::firewall(|| {
         let recorded = preset_recorder::stop_recording();
-        if RECORD_TARGET.with(|t| *t.borrow()) == 1 {
-            SAVE_AS_MACRO.with(|m| *m.borrow_mut() = Some(recorded));
-        } else {
-            NEXT_PRESET_MACRO.with(|m| *m.borrow_mut() = Some(recorded));
+        match RECORD_TARGET.with(|t| *t.borrow()) {
+            1 => SAVE_AS_MACRO.with(|m| *m.borrow_mut() = Some(recorded)),
+            2 => SAVE_PRESET_MACRO.with(|m| *m.borrow_mut() = Some(recorded)),
+            _ => NEXT_PRESET_MACRO.with(|m| *m.borrow_mut() = Some(recorded)),
         }
     });
 }
@@ -87,10 +99,8 @@ pub fn recorded_count(target: i32) -> i32 {
     reaper_low::firewall(|| {
         if preset_recorder::is_recording() {
             preset_recorder::recorded_event_count() as i32
-        } else if target == 1 {
-            SAVE_AS_MACRO.with(|m| m.borrow().as_ref().map(|e| e.len()).unwrap_or(0)) as i32
         } else {
-            NEXT_PRESET_MACRO.with(|m| m.borrow().as_ref().map(|e| e.len()).unwrap_or(0)) as i32
+            macro_slot_len(target) as i32
         }
     })
     .unwrap_or(0)
@@ -142,6 +152,10 @@ pub fn start(stop_if_destination_exists: bool, never_stop_crawling: bool, use_sa
         } else {
             None
         };
+        // If a "Save preset" macro was recorded, save natively (no RfxChain / import).
+        let save_preset_macro = SAVE_PRESET_MACRO
+            .with(|m| m.borrow().clone())
+            .filter(|e| !e.is_empty());
         let state = PresetCrawlingState::new();
         let args = CrawlPresetArgs {
             fx,
@@ -153,6 +167,7 @@ pub fn start(stop_if_destination_exists: bool, never_stop_crawling: bool, use_sa
             save_as_dialog: None,
             next_preset_macro,
             save_as_macro,
+            save_preset_macro,
             // No crawler window to refocus in the standalone case.
             bring_focus_back_to_crawler: || {},
         };
