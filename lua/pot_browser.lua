@@ -255,8 +255,10 @@ local function filter_combo(kind, state)
         local excluded = r.HB_Pot_IsFilterItemExcluded(kind.id, match.index) ~= 0
         -- Excluded items are dimmed (like the original weakens them).
         if excluded then
-          r.ImGui_PushStyleColor(ctx, r.ImGui_Col_Text(),
-            r.ImGui_GetColor(ctx, r.ImGui_Col_TextDisabled()))
+          -- Bind to a local first: GetColor as a nested last argument can expand to
+          -- multiple return values, overflowing PushStyleColor's 3-argument max.
+          local dim = r.ImGui_GetColor(ctx, r.ImGui_Col_TextDisabled())
+          r.ImGui_PushStyleColor(ctx, r.ImGui_Col_Text(), dim)
         end
         if r.ImGui_Selectable(ctx, match.name .. '##' .. match.index, is_selected) then
           action = { action = 'set_filter', filter_id = kind.id, value = match.index }
@@ -295,8 +297,10 @@ local function mini_filter(kind)
     if ok == 0 then name = tostring(i) end
     local active = current == i
     if active then
-      r.ImGui_PushStyleColor(ctx, r.ImGui_Col_Button(),
-        r.ImGui_GetColor(ctx, r.ImGui_Col_ButtonActive()))
+      -- Bind to a local first (see note in filter_combo): nested GetColor as the last
+      -- argument can expand to multiple values and overflow PushStyleColor's 3-arg max.
+      local activecol = r.ImGui_GetColor(ctx, r.ImGui_Col_ButtonActive())
+      r.ImGui_PushStyleColor(ctx, r.ImGui_Col_Button(), activecol)
     end
     if r.ImGui_SmallButton(ctx, name .. '##mini_' .. kind.id .. '_' .. i) then
       r.HB_Pot_SetFilter(kind.id, active and -1 or i)
