@@ -53,6 +53,13 @@ local focus_search_on_next_frame = false
 local auto_preview = true
 local volume_before_mute = nil -- non-nil while muted
 
+-- Preset table sorting. The engine always orders presets name-ascending, so Name/asc is the
+-- identity order and Name/desc is just the reversed index list (no data reads). FX (product)
+-- sorting reads each preset's product and is cached on a cheap signature so it only rebuilds
+-- when the sort spec or the underlying list changes. `perm` maps display row (1-based) -> engine
+-- preset index (0-based); nil means identity.
+local sort_state = { col = 0, desc = false, perm = nil, key = nil }
+
 local filter_search_state = {}
 
 -- Preset Crawler wizard state. `step`: intro | capture | crawling | stopped | importing
@@ -365,6 +372,53 @@ local function selected_preset_info()
   if comment ~= '' then r.ImGui_TextWrapped(ctx, comment) end
 end
 
+-- Builds the display-row (1-based) -> engine-index (0-based) permutation for the current sort.
+-- Returns nil for Name/ascending, which is the engine's native order. Name/descending is the
+-- reversed index list. FX/product sorting reads each preset's product (secondary key: name) and
+-- is cached on a signature so it only rebuilds when the sort or the underlying list changes.
+local function preset_sort_perm(count)
+  local col, desc = sort_state.col, sort_state.desc
+  if count <= 0 or (col == 0 and not desc) then
+    sort_state.key, sort_state.perm = nil, nil
+    return nil -- identity (engine orders presets name-ascending)
+  end
+  local function prod(i)
+    local ok, p = r.HB_Pot_GetPresetProduct(i)
+    return (ok ~= 0 and p) or ''
+  end
+  local key
+  if col == 0 then
+    key = 'name-desc|' .. count
+  else
+    local mid = count // 2
+    key = table.concat({ 'fx', tostring(desc), count, prod(0), prod(mid), prod(count - 1) }, '|')
+  end
+  if sort_state.key == key and sort_state.perm then return sort_state.perm end
+  local perm = {}
+  if col == 0 then
+    for d = 1, count do perm[d] = count - d end -- reverse of the name-ascending engine order
+  else
+    local rows = {}
+    for i = 0, count - 1 do
+      local okn, name = r.HB_Pot_GetPresetName(i)
+      rows[#rows + 1] = {
+        idx = i,
+        prod = prod(i):lower(),
+        name = ((okn ~= 0 and name) or ''):lower(),
+      }
+    end
+    table.sort(rows, function(a, b)
+      if a.prod ~= b.prod then
+        if desc then return a.prod > b.prod else return a.prod < b.prod end
+      end
+      return a.name < b.name -- stable, readable order within a product
+    end)
+    for d = 1, count do perm[d] = rows[d].idx end
+  end
+  sort_state.key, sort_state.perm = key, perm
+  return perm
+end
+
 local function preset_table()
   local count = r.HB_Pot_GetPresetCount()
   if count < 0 then
@@ -376,17 +430,31 @@ local function preset_table()
       | r.ImGui_TableFlags_BordersInnerV()
       | r.ImGui_TableFlags_ScrollY()
       | r.ImGui_TableFlags_Resizable()
+      | r.ImGui_TableFlags_Sortable()
   if r.ImGui_BeginTable(ctx, 'presets', 4, flags) then
-    r.ImGui_TableSetupColumn(ctx, 'Name', r.ImGui_TableColumnFlags_WidthStretch())
+    r.ImGui_TableSetupColumn(ctx, 'Name',
+      r.ImGui_TableColumnFlags_WidthStretch() | r.ImGui_TableColumnFlags_DefaultSort())
     r.ImGui_TableSetupColumn(ctx, 'FX', r.ImGui_TableColumnFlags_WidthStretch())
-    r.ImGui_TableSetupColumn(ctx, 'Ext', r.ImGui_TableColumnFlags_WidthFixed(), 50)
-    r.ImGui_TableSetupColumn(ctx, 'Prev', r.ImGui_TableColumnFlags_WidthFixed(), 40)
+    r.ImGui_TableSetupColumn(ctx, 'Ext',
+      r.ImGui_TableColumnFlags_WidthFixed() | r.ImGui_TableColumnFlags_NoSort(), 50)
+    r.ImGui_TableSetupColumn(ctx, 'Prev',
+      r.ImGui_TableColumnFlags_WidthFixed() | r.ImGui_TableColumnFlags_NoSort(), 40)
     r.ImGui_TableSetupScrollFreeze(ctx, 0, 1)
     r.ImGui_TableHeadersRow(ctx)
+    -- Read the active sort spec (column + direction). Clicking a sortable header toggles
+    -- ascending <-> descending, which is what reorders the rows below.
+    local has_spec, col_index, _, dir = r.ImGui_TableGetColumnSortSpecs(ctx, 0)
+    if has_spec then
+      sort_state.col = col_index
+      sort_state.desc = dir == r.ImGui_SortDirection_Descending()
+    end
+    local perm = preset_sort_perm(count)
     r.ImGui_ListClipper_Begin(clipper, count)
     while r.ImGui_ListClipper_Step(clipper) do
       local first, last = r.ImGui_ListClipper_GetDisplayRange(clipper)
-      for i = first, last - 1 do
+      for row = first, last - 1 do
+        -- Map the display row to the engine preset index via the sort permutation.
+        local i = perm and perm[row + 1] or row
         r.ImGui_TableNextRow(ctx)
         r.ImGui_TableNextColumn(ctx)
         local ok, name = r.HB_Pot_GetPresetName(i)
