@@ -13,8 +13,9 @@ use crate::standalone_unit::standalone_pot_unit;
 use base::{blocking_lock_arc, Global, MouseCursorPosition};
 use pot::preset_crawler::{
     crawl_presets, import_crawled_presets, CrawlPresetArgs, PresetCrawlingOutcome,
-    PresetCrawlingState, PresetCrawlerStopReason, SaveAsDialogScraping, SharedPresetCrawlingState,
+    PresetCrawlingState, PresetCrawlerStopReason, SharedPresetCrawlingState,
 };
+use pot::preset_recorder::{self, RecordedMacro};
 use reaper_high::Reaper;
 use std::cell::RefCell;
 use std::error::Error;
@@ -46,6 +47,39 @@ struct CrawlerSession {
 
 thread_local! {
     static CRAWLER: RefCell<Option<CrawlerSession>> = const { RefCell::new(None) };
+    /// The most recently recorded save-as action macro, reused for the next crawl.
+    static RECORDED_MACRO: RefCell<Option<RecordedMacro>> = const { RefCell::new(None) };
+}
+
+// --- Save-as action recording (delegates to pot::preset_recorder) ---
+
+/// Starts recording the save-as action sequence on a background thread.
+pub fn record_start() {
+    reaper_low::firewall(preset_recorder::start_recording);
+}
+
+/// Stops recording and stores the captured macro for the next crawl.
+pub fn record_stop() {
+    reaper_low::firewall(|| {
+        let recorded = preset_recorder::stop_recording();
+        RECORDED_MACRO.with(|m| *m.borrow_mut() = Some(recorded));
+    });
+}
+
+pub fn is_recording() -> bool {
+    reaper_low::firewall(preset_recorder::is_recording).unwrap_or(false)
+}
+
+/// Events captured so far while recording, or in the stored macro once stopped.
+pub fn recorded_event_count() -> i32 {
+    reaper_low::firewall(|| {
+        if preset_recorder::is_recording() {
+            preset_recorder::recorded_event_count() as i32
+        } else {
+            RECORDED_MACRO.with(|m| m.borrow().as_ref().map(|e| e.len()).unwrap_or(0)) as i32
+        }
+    })
+    .unwrap_or(0)
 }
 
 fn pos(x: i32, y: i32) -> MouseCursorPosition {
@@ -56,17 +90,15 @@ fn pos(x: i32, y: i32) -> MouseCursorPosition {
 ///
 /// Returns 1 on success, 0 if there's no suitable focused FX or a crawl/import is already
 /// in progress.
-#[allow(clippy::too_many_arguments)]
+/// `use_save_as`: when true, preset names are scraped by replaying the recorded save-as
+/// macro (capture it first via [`record_start`]/[`record_stop`]); when false, names come
+/// from the host API.
 pub fn start(
     next_x: i32,
     next_y: i32,
     stop_if_destination_exists: bool,
     never_stop_crawling: bool,
     use_save_as: bool,
-    save_x: i32,
-    save_y: i32,
-    cancel_x: i32,
-    cancel_y: i32,
 ) -> i32 {
     reaper_low::firewall(|| {
         // Don't start over a crawl/import that's still in flight.
@@ -88,22 +120,24 @@ pub fn start(
         if fx.floating_window().is_none() {
             return 0;
         }
-        let state = PresetCrawlingState::new();
-        let save_as_dialog = if use_save_as {
-            Some(SaveAsDialogScraping {
-                save_as_button_pos: pos(save_x, save_y),
-                cancel_button_pos: pos(cancel_x, cancel_y),
-            })
+        // Save-as mode requires a recorded macro to have been captured.
+        let save_as_macro = if use_save_as {
+            match RECORDED_MACRO.with(|m| m.borrow().clone()) {
+                Some(events) if !events.is_empty() => Some(events),
+                _ => return 0,
+            }
         } else {
             None
         };
+        let state = PresetCrawlingState::new();
         let args = CrawlPresetArgs {
             fx,
             next_preset_cursor_pos: pos(next_x, next_y),
             state: state.clone(),
             stop_if_destination_exists,
             never_stop_crawling,
-            save_as_dialog,
+            save_as_dialog: None,
+            save_as_macro,
             // No crawler window to refocus in the standalone case.
             bring_focus_back_to_crawler: || {},
         };

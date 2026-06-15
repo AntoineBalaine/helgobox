@@ -49,6 +49,7 @@ mod worker;
 pub use worker::*;
 mod escape_catcher;
 pub mod preset_crawler;
+pub mod preset_recorder;
 pub mod preview_recorder;
 use crate::preset_crawler::get_shim_file_path;
 use crate::preview_recorder::get_preview_file_path_from_hash;

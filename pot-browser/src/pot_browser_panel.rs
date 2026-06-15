@@ -1403,6 +1403,9 @@ fn process_dialogs(input: ProcessDialogsInput, ctx: &Context) {
                         } else {
                             None
                         },
+                        // The egui browser uses fixed-position scraping, not the recorded
+                        // macro (that's the standalone/Lua path).
+                        save_as_macro: None,
                         bring_focus_back_to_crawler: move || {
                             os_window.focus_first_child();
                         },

@@ -39,6 +39,20 @@ impl EnigoMouse {
         self.enigo.key_click(enigo::Key::Layout('c'));
         self.enigo.key_up(modifier);
     }
+
+    /// Presses a raw platform keycode (e.g. macOS CGKeyCode, X11 keycode). Used to replay
+    /// recorded keystrokes by physical position, which is layout-independent (the OS maps
+    /// the physical key through the active layout). See `pot::preset_recorder`.
+    pub fn press_raw_key(&mut self, raw: u16) {
+        use enigo::KeyboardControllable;
+        self.enigo.key_down(enigo::Key::Raw(raw));
+    }
+
+    /// Releases a raw platform keycode. See [`Self::press_raw_key`].
+    pub fn release_raw_key(&mut self, raw: u16) {
+        use enigo::KeyboardControllable;
+        self.enigo.key_up(enigo::Key::Raw(raw));
+    }
 }
 
 fn create_device_state() -> Option<DeviceState> {

@@ -66,6 +66,7 @@ local crawler = {
   use_save_as = false,
   points = {},
   overlay_armed = false,
+  recording_started = false,
 }
 
 -- Preview Recorder wizard state. `step`: intro | preparing | ready | recording | done
@@ -629,15 +630,12 @@ local function toolbar()
   end
 end
 
--- Order of the screen positions the crawler needs to capture by click.
-local CRAWL_CAPTURE_LABELS = {
-  'the plug-in\'s "Next preset" button',
-  'the plug-in\'s "Save Preset As" button',
-  'the Save-As dialog\'s "Cancel" button',
-}
+-- The crawler captures one position by click (the plug-in's "Next preset" button). The
+-- "Save Preset As" name-scrape is captured separately as an action recording, not points.
+local CRAWL_CAPTURE_LABELS = { 'the plug-in\'s "Next preset" button' }
 
 local function crawler_points_needed()
-  return crawler.use_save_as and 3 or 1
+  return 1
 end
 
 -- Full-screen, borderless, top-most, transparent overlay that captures click positions in
@@ -739,19 +737,55 @@ local function crawler_render()
         crawler.overlay_armed = true
       end
       r.ImGui_SameLine(ctx)
-      if #crawler.points >= crawler_points_needed() then
-        if r.ImGui_Button(ctx, 'Start crawling') then
-          local p = crawler.points
-          local sx, sy = (p[2] and p[2][1] or 0), (p[2] and p[2][2] or 0)
-          local cx, cy = (p[3] and p[3][1] or 0), (p[3] and p[3][2] or 0)
-          local started = r.HB_Pot_CrawlerStart(p[1][1], p[1][2],
-            crawler.stop_if_dest and 1 or 0, crawler.never_stop and 1 or 0,
-            crawler.use_save_as and 1 or 0, sx, sy, cx, cy)
-          crawler.step = (started ~= 0) and 'crawling' or 'failed'
+      if #crawler.points >= 1 then
+        if crawler.use_save_as then
+          if r.ImGui_Button(ctx, 'Next: record save-as actions') then
+            crawler.step = 'record'
+          end
+        else
+          if r.ImGui_Button(ctx, 'Start crawling') then
+            local p = crawler.points
+            local started = r.HB_Pot_CrawlerStart(p[1][1], p[1][2],
+              crawler.stop_if_dest and 1 or 0, crawler.never_stop and 1 or 0, 0)
+            crawler.step = (started ~= 0) and 'crawling' or 'failed'
+          end
         end
         r.ImGui_SameLine(ctx)
       end
       if r.ImGui_Button(ctx, 'Back') then crawler.step = 'intro' end
+    end
+  elseif step == 'record' then
+    r.ImGui_TextWrapped(ctx, 'Record the "Save Preset As" name-grab once: click Record, then '
+      .. 'on the plug-in do the whole flow -- open Save As, click into the name field, '
+      .. 'select all and copy (Cmd/Ctrl+A, Cmd/Ctrl+C), then Cancel -- and press Escape to '
+      .. 'finish. It replays per preset to read each name.')
+    r.ImGui_Separator(ctx)
+    local recording = r.HB_Pot_CrawlerIsRecording() ~= 0
+    local count = r.HB_Pot_CrawlerRecordedEventCount()
+    if recording then
+      r.ImGui_Text(ctx, string.format('Recording... %d actions. Press Escape when done.', count))
+    else
+      -- Recording just ended (Escape) -> finalize and store the macro.
+      if crawler.recording_started then
+        r.HB_Pot_CrawlerRecordStop()
+        crawler.recording_started = false
+      end
+      r.ImGui_Text(ctx, string.format('Recorded %d actions.', count))
+      if r.ImGui_Button(ctx, count > 0 and 'Re-record' or 'Record') then
+        r.HB_Pot_CrawlerRecordStart()
+        crawler.recording_started = true
+      end
+      r.ImGui_SameLine(ctx)
+      if count > 0 then
+        if r.ImGui_Button(ctx, 'Start crawling') then
+          local p = crawler.points
+          local started = r.HB_Pot_CrawlerStart(p[1][1], p[1][2],
+            crawler.stop_if_dest and 1 or 0, crawler.never_stop and 1 or 0, 1)
+          crawler.step = (started ~= 0) and 'crawling' or 'failed'
+        end
+        r.ImGui_SameLine(ctx)
+      end
+      if r.ImGui_Button(ctx, 'Back') then crawler.step = 'capture' end
     end
   elseif step == 'crawling' then
     r.ImGui_Text(ctx, 'Crawling... press Escape (over the plug-in) to stop.')

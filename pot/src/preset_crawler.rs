@@ -1,3 +1,4 @@
+use crate::preset_recorder::{topmost_window_at, ClickButton, InputEvent, RecordedMacro};
 use crate::{
     parse_vst2_magic_number, parse_vst3_uid, pot_db, EscapeCatcher, PersistentPresetId, PluginId,
 };
@@ -221,6 +222,10 @@ pub struct CrawlPresetArgs<F> {
     /// dialog instead of asking the REAPER API. For plug-ins that don't expose their
     /// preset names.
     pub save_as_dialog: Option<SaveAsDialogScraping>,
+    /// If set, preset names are scraped by replaying a recorded action macro (clicks +
+    /// keystrokes) instead of the fixed two-position `save_as_dialog`. Takes precedence
+    /// over `save_as_dialog` when both are set. See [`crate::preset_recorder`].
+    pub save_as_macro: Option<RecordedMacro>,
     pub bring_focus_back_to_crawler: F,
 }
 
@@ -262,30 +267,30 @@ where
                 PresetCrawlerStopReason::Interrupted,
             ));
         }
-        // Get preset name
-        let name = match &args.save_as_dialog {
+        // Get preset name. Preference: recorded macro > fixed-position scraping > host API.
+        let scraped = if let Some(macro_events) = &args.save_as_macro {
+            // Make sure the plug-in window is visible/front before replaying into it.
+            args.fx.show_in_floating_window()?;
+            Some(replay_macro_and_scrape(&mut mouse, macro_events, &escape_catcher).await?)
+        } else if let Some(config) = &args.save_as_dialog {
+            args.fx.show_in_floating_window()?;
+            let config = *config;
+            Some(scrape_preset_name_via_save_as_dialog(&mut mouse, config, &escape_catcher).await?)
+        } else {
+            None
+        };
+        let name = match scraped {
             None => args
                 .fx
                 .preset_name()
                 .ok_or("couldn't get preset name")?
                 .into_string(),
-            Some(config) => {
-                // Make sure the plug-in window is visible before clicking into it.
-                // (Called here and not inside the scrape function because holding a
-                // reference to the FX across an await point would require Fx: Sync.)
-                args.fx.show_in_floating_window()?;
-                let config = *config;
-                match scrape_preset_name_via_save_as_dialog(&mut mouse, config, &escape_catcher)
-                    .await?
-                {
-                    ScrapedName::Name(name) => name,
-                    ScrapedName::Interrupted => {
-                        return Ok(PresetCrawlingOutcome::new(
-                            chunks_file,
-                            PresetCrawlerStopReason::Interrupted,
-                        ));
-                    }
-                }
+            Some(ScrapedName::Name(name)) => name,
+            Some(ScrapedName::Interrupted) => {
+                return Ok(PresetCrawlingOutcome::new(
+                    chunks_file,
+                    PresetCrawlerStopReason::Interrupted,
+                ));
             }
         };
         {
@@ -400,6 +405,99 @@ async fn scrape_preset_name_via_save_as_dialog(
     let name = name.trim();
     if name.is_empty() {
         return Err("the \"Save Preset As\" dialog yielded an empty preset name".into());
+    }
+    Ok(ScrapedName::Name(name.to_string()))
+}
+
+/// Finds the currently-open window with the given xcap id, if any.
+fn find_window_by_id(id: u32) -> Option<xcap::Window> {
+    xcap::Window::all().ok()?.into_iter().find(|w| w.id() == id)
+}
+
+/// Replays a recorded save-as action macro, then reads the preset name from the clipboard.
+///
+/// Each click is **verified** before firing: the macro stored which window the click landed
+/// in, and we re-resolve that window's current position and refuse to click unless it's the
+/// topmost window there — so a window that drifted or got covered aborts the crawl rather
+/// than clicking something random. Keys replay by physical position (`Key::Raw`), which
+/// reproduces the user's keystrokes under any keyboard layout.
+async fn replay_macro_and_scrape(
+    mouse: &mut EnigoMouse,
+    macro_events: &[InputEvent],
+    escape_catcher: &EscapeCatcher,
+) -> Result<ScrapedName, Box<dyn Error + Send + Sync>> {
+    // Sentinel so we can tell whether the copy actually happened.
+    set_clipboard_text(CLIPBOARD_SENTINEL)?;
+    for ev in macro_events {
+        if escape_catcher.escape_was_pressed() {
+            return Ok(ScrapedName::Interrupted);
+        }
+        match ev {
+            InputEvent::Click {
+                button,
+                win_id,
+                off_x,
+                off_y,
+                delay_ms,
+                ..
+            } => {
+                millis((*delay_ms).min(5000)).await;
+                if *win_id == 0 {
+                    return Err("a recorded click has no associated window — on macOS, grant \
+                                Screen Recording so windows resolve, then re-record"
+                        .into());
+                }
+                // Re-resolve the target window's current rect and verify it's topmost. The
+                // xcap `Window` handles are dropped before any await (they may be !Send).
+                let (tx, ty) = {
+                    let win = find_window_by_id(*win_id)
+                        .ok_or("a window targeted by the recorded actions is no longer open")?;
+                    let (tx, ty) = (win.x() + off_x, win.y() + off_y);
+                    match topmost_window_at(tx, ty) {
+                        Some(top) if top.id() == *win_id => {}
+                        Some(top) => {
+                            return Err(format!(
+                                "expected window {win_id} at ({tx},{ty}) during replay but \
+                                 '{}' is on top — aborting to avoid clicking the wrong window",
+                                top.app_name()
+                            )
+                            .into());
+                        }
+                        None => {
+                            return Err(format!("no window at ({tx},{ty}) during replay").into());
+                        }
+                    }
+                    (tx, ty)
+                };
+                let pos = MouseCursorPosition::new(tx.max(0) as u32, ty.max(0) as u32);
+                mouse.set_cursor_position(pos)?;
+                moment().await;
+                let b = match button {
+                    ClickButton::Left => MouseButton::Left,
+                    ClickButton::Right => MouseButton::Right,
+                };
+                mouse.press(b)?;
+                moment().await;
+                mouse.release(b)?;
+            }
+            InputEvent::KeyDown { raw, delay_ms } => {
+                millis((*delay_ms).min(5000)).await;
+                mouse.press_raw_key(*raw);
+            }
+            InputEvent::KeyUp { raw, delay_ms } => {
+                millis((*delay_ms).min(5000)).await;
+                mouse.release_raw_key(*raw);
+            }
+        }
+    }
+    a_bit_longer().await;
+    let name = clipboard_text()?;
+    if name == CLIPBOARD_SENTINEL {
+        return Err("the recorded actions didn't copy a preset name to the clipboard".into());
+    }
+    let name = name.trim();
+    if name.is_empty() {
+        return Err("the recorded actions yielded an empty preset name".into());
     }
     Ok(ScrapedName::Name(name.to_string()))
 }

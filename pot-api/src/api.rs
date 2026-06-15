@@ -1338,17 +1338,12 @@ unsafe extern "C" fn vararg_HB_Pot_IsFocusedFxOpenFloating(
 // Preset crawler
 // ---------------------------------------------------------------------------
 
-#[allow(clippy::too_many_arguments)]
 extern "C" fn HB_Pot_CrawlerStart(
     next_x: c_int,
     next_y: c_int,
     stop_if_destination_exists: c_int,
     never_stop: c_int,
     use_save_as: c_int,
-    save_x: c_int,
-    save_y: c_int,
-    cancel_x: c_int,
-    cancel_y: c_int,
 ) -> c_int {
     crate::crawler::start(
         next_x,
@@ -1356,10 +1351,6 @@ extern "C" fn HB_Pot_CrawlerStart(
         stop_if_destination_exists != 0,
         never_stop != 0,
         use_save_as != 0,
-        save_x,
-        save_y,
-        cancel_x,
-        cancel_y,
     )
 }
 unsafe extern "C" fn vararg_HB_Pot_CrawlerStart(args: *mut *mut c_void, n: c_int) -> *mut c_void {
@@ -1369,11 +1360,49 @@ unsafe extern "C" fn vararg_HB_Pot_CrawlerStart(args: *mut *mut c_void, n: c_int
         int_arg(args, n, 2),
         int_arg(args, n, 3),
         int_arg(args, n, 4),
-        int_arg(args, n, 5),
-        int_arg(args, n, 6),
-        int_arg(args, n, 7),
-        int_arg(args, n, 8),
     ))
+}
+
+extern "C" fn HB_Pot_CrawlerRecordStart() {
+    crate::crawler::record_start();
+}
+unsafe extern "C" fn vararg_HB_Pot_CrawlerRecordStart(
+    _: *mut *mut c_void,
+    _: c_int,
+) -> *mut c_void {
+    HB_Pot_CrawlerRecordStart();
+    std::ptr::null_mut()
+}
+
+extern "C" fn HB_Pot_CrawlerRecordStop() {
+    crate::crawler::record_stop();
+}
+unsafe extern "C" fn vararg_HB_Pot_CrawlerRecordStop(
+    _: *mut *mut c_void,
+    _: c_int,
+) -> *mut c_void {
+    HB_Pot_CrawlerRecordStop();
+    std::ptr::null_mut()
+}
+
+extern "C" fn HB_Pot_CrawlerIsRecording() -> c_int {
+    crate::crawler::is_recording() as c_int
+}
+unsafe extern "C" fn vararg_HB_Pot_CrawlerIsRecording(
+    _: *mut *mut c_void,
+    _: c_int,
+) -> *mut c_void {
+    ret_int(HB_Pot_CrawlerIsRecording())
+}
+
+extern "C" fn HB_Pot_CrawlerRecordedEventCount() -> c_int {
+    crate::crawler::recorded_event_count()
+}
+unsafe extern "C" fn vararg_HB_Pot_CrawlerRecordedEventCount(
+    _: *mut *mut c_void,
+    _: c_int,
+) -> *mut c_void {
+    ret_int(HB_Pot_CrawlerRecordedEventCount())
 }
 
 extern "C" fn HB_Pot_CrawlerPhase() -> c_int {
@@ -1703,6 +1732,10 @@ macro_rules! paste_vararg {
     (HB_Pot_CrawlerError) => { vararg_HB_Pot_CrawlerError };
     (HB_Pot_CrawlerImport) => { vararg_HB_Pot_CrawlerImport };
     (HB_Pot_CrawlerDiscard) => { vararg_HB_Pot_CrawlerDiscard };
+    (HB_Pot_CrawlerRecordStart) => { vararg_HB_Pot_CrawlerRecordStart };
+    (HB_Pot_CrawlerRecordStop) => { vararg_HB_Pot_CrawlerRecordStop };
+    (HB_Pot_CrawlerIsRecording) => { vararg_HB_Pot_CrawlerIsRecording };
+    (HB_Pot_CrawlerRecordedEventCount) => { vararg_HB_Pot_CrawlerRecordedEventCount };
     (HB_Pot_RecorderPrepare) => { vararg_HB_Pot_RecorderPrepare };
     (HB_Pot_RecorderPhase) => { vararg_HB_Pot_RecorderPhase };
     (HB_Pot_RecorderIsRunning) => { vararg_HB_Pot_RecorderIsRunning };
@@ -1844,7 +1877,15 @@ fn pot_api_fns() -> Vec<PotApiFn> {
         HB_Pot_IsFocusedFxOpenFloating:
             b"int\0\0\0Returns 1 if there is a focused FX and it is open in a floating window (a precondition for the preset crawler).\0";
         HB_Pot_CrawlerStart:
-            b"int\0int,int,int,int,int,int,int,int,int\0next_x,next_y,stop_if_destination_exists,never_stop,use_save_as,save_x,save_y,cancel_x,cancel_y\0Starts crawling the focused FX (must be open in a floating window). next_x/next_y: screen position of the plug-in's \"Next preset\" button. If use_save_as is 1, preset names are scraped from the plug-in's \"Save Preset As\" dialog using save_x/save_y (the dialog button) and cancel_x/cancel_y (its Cancel button). Returns 1 if started, 0 otherwise.\0";
+            b"int\0int,int,int,int,int\0next_x,next_y,stop_if_destination_exists,never_stop,use_save_as\0Starts crawling the focused FX (must be open in a floating window). next_x/next_y: screen position of the plug-in's \"Next preset\" button. If use_save_as is 1, preset names are scraped by replaying the recorded save-as macro (record it first with HB_Pot_CrawlerRecordStart/Stop); otherwise names come from the host API. Returns 1 if started, 0 otherwise (e.g. save-as mode with no recorded macro).\0";
+        HB_Pot_CrawlerRecordStart:
+            b"void\0\0\0Starts recording the \"Save Preset As\" action sequence (clicks + keystrokes) on a background thread. Demonstrate the flow on the plug-in, then press Escape (or call HB_Pot_CrawlerRecordStop) to finish.\0";
+        HB_Pot_CrawlerRecordStop:
+            b"void\0\0\0Stops recording the save-as action sequence and stores it for the next crawl.\0";
+        HB_Pot_CrawlerIsRecording:
+            b"int\0\0\0Returns 1 while a save-as action recording is in progress (0 once Escape is pressed or it is stopped).\0";
+        HB_Pot_CrawlerRecordedEventCount:
+            b"int\0\0\0Returns the number of recorded save-as actions captured so far (or in the stored macro once recording stopped).\0";
         HB_Pot_CrawlerPhase:
             b"int\0\0\0Returns the crawler phase: 0=idle, 1=crawling, 2=stopped (ready to import/discard), 3=importing, 4=done, 5=failed.\0";
         HB_Pot_CrawlerIsRunning:
