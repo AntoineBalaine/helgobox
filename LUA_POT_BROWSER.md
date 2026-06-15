@@ -253,9 +253,47 @@ The recorded event list lives in Rust (a recorder module in `pot-api`, or upstre
 the stored recording when save-as mode is on (replacing the two fixed positions). Keep the
 fixed-position path working until the recorder is verified, so nothing regresses.
 
-### Proof of concept
-A standalone Rust binary (outside the workspace, `pot-input-poc/`) that depends only on
-`device_query` + `xcap` + `enigo` at the same versions, records window-relative clicks,
-then replays them — so the core record/resolve/replay loop and the coordinate-space
-question can be validated on the user's machine **without** REAPER or the pot stack. If the
-PoC replays correctly after moving the target window, integrate into the crawler.
+### Proof of concept — VALIDATED (standalone `pot-input-poc/`, macOS)
+A standalone Rust binary (outside the workspace) depending only on
+`device_query` + `xcap` + `enigo` + `arboard`, validated on macOS. Findings:
+
+- **Window-relative click record/replay works.** Clicks resolve to the topmost window
+  under the cursor — xcap returns windows **front-to-back** on macOS, so the *first*
+  containing window is the hit (NOT smallest-area). Replay re-resolves the window's current
+  rect, so clicks land correctly even after the window is moved.
+- **Keystrokes must be replayed by PHYSICAL keycode, not character** — this is the big
+  one. `device_query` reports physical key *positions* named by US-QWERTY; `enigo::Key::
+  Layout(char)` sends *characters*. On a non-QWERTY layout (tested: bépo) these don't
+  correspond — e.g. the user's Cmd+C is the physical key at QWERTY-H, logged as `Keycode::
+  H`; replaying it as `Layout('h')` fired Cmd+H (Hide) and broke the session. Fix: map the
+  device_query Keycode to the macOS virtual keycode for the *same physical position*
+  (`Keycode::H -> kVK_ANSI_H`) and replay via `enigo::Key::Raw`. That presses the same
+  physical key, which under the active layout produces the same character → Cmd+C copies
+  correctly, layout-independent. (Only assumption: layout unchanged between record and
+  replay — always true in-session.)
+- **The keyboard copy path works end to end** — recorded bépo Cmd+A/Cmd+C replayed and the
+  plug-in's preset name landed in the clipboard (read back via `arboard`). The keyboard
+  path is sufficient and universal: every text field supports Cmd+A/Cmd+C, so there is **no
+  need** for a mouse-only right-click→Copy path or click-drag selection (a drag *would* be
+  needed for mouse selection, which we deliberately skip).
+- **Vital draws its Save-As dialog in-view** (no separate OS window): all clicks resolved
+  to Vital's main window id. So the transient-dialog-id concern doesn't arise for Vital
+  (clicks anchor to the stable plug-in window). Other plug-ins may differ.
+- **Permissions (macOS):** device_query needs Accessibility **and** Input Monitoring (the
+  latter specifically for keystrokes); enigo needs Accessibility for replay; xcap needs
+  **Screen Recording** for window enumeration (without it, only the menu bar is returned).
+
+### Revised integration plan (from PoC learnings)
+- **Coordinates: absolute by default, window-relative as an upgrade.** In a real crawl the
+  flow is recorded once and replayed immediately with the plug-in window stationary, so
+  *absolute* coordinates suffice and need **no Screen Recording** — matching the existing
+  crawler's permission footprint (Accessibility only). The recorder stores both absolute
+  and window-relative; replay prefers window-relative when Screen Recording is available,
+  else falls back to absolute. So Screen Recording is a graceful upgrade, not a hard gate.
+- **Keystrokes via physical keycode** (`Key::Raw`), per the bépo finding above. Per-platform
+  keycode tables (the PoC has the macOS table).
+- **Recorded macro lives in Rust**, never crossing into Lua; Lua drives it with
+  `HB_Pot_CrawlerRecordStart/Stop/RecordedEventCount`, and `HB_Pot_CrawlerStart` consumes it
+  when save-as mode is on (replacing the two fixed positions). Keep the fixed-position path
+  working until the recorder is verified.
+- **Drop** the mouse-only right-click→Copy and click-drag paths (Cmd+C is universal).
