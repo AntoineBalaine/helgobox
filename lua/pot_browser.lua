@@ -321,13 +321,39 @@ local function db_label(permille)
   return string.format('%.1f dB', 20 * math.log(permille / 1000, 10))
 end
 
-local function reveal_or_copy(path)
+local OS = r.GetOS()
+local IS_MAC = OS:match('OSX') ~= nil or OS:match('macOS') ~= nil
+local IS_WIN = OS:match('Win') ~= nil
+-- Name of the system file manager, for menu labels.
+local FILE_MANAGER = IS_MAC and 'Finder' or (IS_WIN and 'Explorer' or 'file manager')
+
+-- POSIX single-quote escaping (macOS/Linux): everything is literal inside single quotes except
+-- a single quote itself, which we close, escape, and reopen.
+local function shell_quote(s)
+  return "'" .. tostring(s):gsub("'", "'\\''") .. "'"
+end
+
+-- Reveals (and selects) a file in the system file manager. Prefers SWS CF_LocateInExplorer when
+-- present (cross-platform), otherwise runs a native per-OS command so it works without SWS.
+local function reveal_in_file_manager(path)
   if path == nil or path == '' then return end
   if r.CF_LocateInExplorer then
     r.CF_LocateInExplorer(path)
+  elseif IS_MAC then
+    os.execute('open -R ' .. shell_quote(path))
+  elseif IS_WIN then
+    -- explorer selects the file with /select, and wants backslashes.
+    os.execute('explorer /select,"' .. tostring(path):gsub('/', '\\') .. '"')
   else
-    -- No SWS: fall back to putting the path on the clipboard.
-    r.ImGui_SetClipboardText(ctx, path)
+    -- Linux/other: ask the freedesktop file manager to show (select) the item; if that's not
+    -- available, fall back to opening the containing folder.
+    local show = 'dbus-send --print-reply --dest=org.freedesktop.FileManager1 '
+        .. '/org/freedesktop/FileManager1 org.freedesktop.FileManager1.ShowItems '
+        .. 'array:string:' .. shell_quote('file://' .. path) .. ' string:"" >/dev/null 2>&1'
+    if not os.execute(show) then
+      local dir = path:match('^(.*)/[^/]+$') or path
+      os.execute('xdg-open ' .. shell_quote(dir) .. ' >/dev/null 2>&1')
+    end
   end
 end
 
@@ -374,24 +400,31 @@ end
 
 -- Builds the display-row (1-based) -> engine-index (0-based) permutation for the current sort.
 -- Returns nil for Name/ascending, which is the engine's native order. Name/descending is the
--- reversed index list. FX/product sorting reads each preset's product (secondary key: name) and
--- is cached on a signature so it only rebuilds when the sort or the underlying list changes.
+-- reversed index list. FX (product) and Ext (file extension) sorting read each preset's value
+-- (secondary key: name) and are cached on a signature so they only rebuild when the sort or the
+-- underlying list changes. Columns: 0 = Name, 1 = FX, 2 = Ext.
 local function preset_sort_perm(count)
   local col, desc = sort_state.col, sort_state.desc
   if count <= 0 or (col == 0 and not desc) then
     sort_state.key, sort_state.perm = nil, nil
     return nil -- identity (engine orders presets name-ascending)
   end
-  local function prod(i)
-    local ok, p = r.HB_Pot_GetPresetProduct(i)
-    return (ok ~= 0 and p) or ''
+  -- Sort key for the active value column (Name is handled without reads, below).
+  local function value(i)
+    local ok, v
+    if col == 1 then
+      ok, v = r.HB_Pot_GetPresetProduct(i)
+    else -- col == 2 (Ext)
+      ok, v = r.HB_Pot_GetPresetFileExt(i)
+    end
+    return (ok ~= 0 and v) or ''
   end
   local key
   if col == 0 then
     key = 'name-desc|' .. count
   else
     local mid = count // 2
-    key = table.concat({ 'fx', tostring(desc), count, prod(0), prod(mid), prod(count - 1) }, '|')
+    key = table.concat({ col, tostring(desc), count, value(0), value(mid), value(count - 1) }, '|')
   end
   if sort_state.key == key and sort_state.perm then return sort_state.perm end
   local perm = {}
@@ -403,15 +436,15 @@ local function preset_sort_perm(count)
       local okn, name = r.HB_Pot_GetPresetName(i)
       rows[#rows + 1] = {
         idx = i,
-        prod = prod(i):lower(),
+        val = value(i):lower(),
         name = ((okn ~= 0 and name) or ''):lower(),
       }
     end
     table.sort(rows, function(a, b)
-      if a.prod ~= b.prod then
-        if desc then return a.prod > b.prod else return a.prod < b.prod end
+      if a.val ~= b.val then
+        if desc then return a.val > b.val else return a.val < b.val end
       end
-      return a.name < b.name -- stable, readable order within a product
+      return a.name < b.name -- stable, readable order within equal values
     end)
     for d = 1, count do perm[d] = rows[d].idx end
   end
@@ -435,8 +468,7 @@ local function preset_table()
     r.ImGui_TableSetupColumn(ctx, 'Name',
       r.ImGui_TableColumnFlags_WidthStretch() | r.ImGui_TableColumnFlags_DefaultSort())
     r.ImGui_TableSetupColumn(ctx, 'FX', r.ImGui_TableColumnFlags_WidthStretch())
-    r.ImGui_TableSetupColumn(ctx, 'Ext',
-      r.ImGui_TableColumnFlags_WidthFixed() | r.ImGui_TableColumnFlags_NoSort(), 50)
+    r.ImGui_TableSetupColumn(ctx, 'Ext', r.ImGui_TableColumnFlags_WidthFixed(), 50)
     r.ImGui_TableSetupColumn(ctx, 'Prev',
       r.ImGui_TableColumnFlags_WidthFixed() | r.ImGui_TableColumnFlags_NoSort(), 40)
     r.ImGui_TableSetupScrollFreeze(ctx, 0, 1)
@@ -467,15 +499,17 @@ local function preset_table()
         if r.ImGui_IsItemHovered(ctx) and r.ImGui_IsMouseDoubleClicked(ctx, 0) then
           r.HB_Pot_LoadPreset(i)
         end
-        -- Right-click: show preset / preview in file manager (or copy path without SWS).
+        -- Right-click: reveal the preset file or the preview audio file in the file manager.
         if r.ImGui_BeginPopupContextItem(ctx, 'pctx_' .. i) then
           local _, ppath = r.HB_Pot_GetPresetPath(i)
           local _, vpath = r.HB_Pot_GetPreviewPath(i)
-          if ppath and ppath ~= '' and r.ImGui_MenuItem(ctx, 'Show preset in file manager') then
-            reveal_or_copy(ppath)
+          if ppath and ppath ~= '' and
+              r.ImGui_MenuItem(ctx, 'Show preset file in ' .. FILE_MANAGER) then
+            reveal_in_file_manager(ppath)
           end
-          if vpath and vpath ~= '' and r.ImGui_MenuItem(ctx, 'Show preview in file manager') then
-            reveal_or_copy(vpath)
+          if vpath and vpath ~= '' and
+              r.ImGui_MenuItem(ctx, 'Show preview audio file in ' .. FILE_MANAGER) then
+            reveal_in_file_manager(vpath)
           end
           r.ImGui_EndPopup(ctx)
         end
