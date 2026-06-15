@@ -20,44 +20,23 @@
 //!   explicit stop, or a timeout.
 
 use device_query::{DeviceQuery, DeviceState, Keycode};
-use image::DynamicImage;
 use std::collections::HashSet;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
-use xcap::{Monitor, Window};
+use xcap::Window;
 
 const POLL_INTERVAL: Duration = Duration::from_millis(3);
 const MAX_RECORD: Duration = Duration::from_secs(120);
 /// Max gap + distance for consecutive clicks to count as one multi-click sequence.
 const MULTI_CLICK_INTERVAL: Duration = Duration::from_millis(500);
 const MULTI_CLICK_DIST: i32 = 6;
-/// Size (physical px) of the grayscale screen patch captured around each click for
-/// image-verified replay. Big enough to be distinctive (catches a menu item's text/icon),
-/// small enough to match fast and tolerate the click sitting near a patch edge.
-const PATCH_W: u32 = 120;
-const PATCH_H: u32 = 72;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ClickButton {
     Left,
     Right,
-}
-
-/// A small grayscale screen patch captured around a click point at record time, used to
-/// re-locate that spot on screen at replay time (template matching). All fields are in the
-/// capturing monitor's *physical* pixel space.
-#[derive(Clone, Debug)]
-pub struct ClickPatch {
-    /// Row-major `Luma8` pixels, exactly `w * h` bytes.
-    pub bytes: Vec<u8>,
-    pub w: u32,
-    pub h: u32,
-    /// Where the actual click point sits inside the patch (normally near the centre, but
-    /// clamped when the click was near a screen edge).
-    pub click_x: u32,
-    pub click_y: u32,
 }
 
 /// One recorded input event. Clicks carry both window-relative anchoring (for verified,
@@ -77,14 +56,6 @@ pub enum InputEvent {
         /// a recorded triple-click replays as a real triple-click (needed to select text in
         /// native dialogs); elsewhere replay timing reproduces it.
         clicks: u8,
-        /// True if this click landed in a window that had just appeared (a dialog/menu that
-        /// opened since the previous click). Drives event-driven replay: replay waits for
-        /// that new window to actually appear rather than sleeping the recorded delay.
-        wait_for_window: bool,
-        /// Grayscale screen patch around the click, for image-verified replay (locate the
-        /// patch on screen, then click it). Captured only for the first click of a group
-        /// (`clicks == 1`); multi-click continuations reuse the first click's location.
-        patch: Option<ClickPatch>,
         delay_ms: u64,
     },
     KeyDown {
@@ -185,35 +156,13 @@ fn stamp(last: &mut Instant) -> u64 {
 
 fn record_loop(stop: Arc<AtomicBool>, running: Arc<AtomicBool>, events: Arc<Mutex<Vec<InputEvent>>>) {
     let device = DeviceState::new();
-    // Patch capture runs on this dedicated worker, fed click (index, x, y) by the poll loop, so
-    // the slow screenshot never blocks input polling (see the click handler). It fills each
-    // click's `patch` field by index; we drop the sender and join it on stop so every patch is
-    // present before the macro is read.
-    let (cap_tx, cap_rx) = std::sync::mpsc::channel::<(usize, i32, i32)>();
-    let cap_events = events.clone();
-    let cap_handle = std::thread::spawn(move || {
-        while let Ok((idx, x, y)) = cap_rx.recv() {
-            let patch = capture_click_patch(x, y);
-            if patch.is_some() {
-                if let Ok(mut e) = cap_events.lock() {
-                    if let Some(InputEvent::Click { patch: slot, .. }) = e.get_mut(idx) {
-                        *slot = patch;
-                    }
-                }
-            }
-        }
-    });
     let start = Instant::now();
     let mut last_event = start;
     let mut prev_left = false;
     let mut prev_right = false;
     let mut prev_keys: HashSet<Keycode> = HashSet::new();
-    // Tracks the previous click for multi-click detection: (time, x, y, count, button).
-    let mut last_click: Option<(Instant, i32, i32, u8, ClickButton)> = None;
-    // Window-id set as of the previous click, to detect dialogs/menus that just appeared.
-    let mut prev_click_window_ids: HashSet<u32> = Window::all()
-        .map(|ws| ws.iter().map(|w| w.id()).collect())
-        .unwrap_or_default();
+    // Tracks the previous click for multi-click detection: (time, x, y, count).
+    let mut last_click: Option<(Instant, i32, i32, u8)> = None;
 
     loop {
         if stop.load(Ordering::Relaxed) || start.elapsed() > MAX_RECORD {
@@ -234,11 +183,8 @@ fn record_loop(stop: Arc<AtomicBool>, running: Arc<AtomicBool>, events: Arc<Mute
         if let Some(button) = clicked {
             let now = Instant::now();
             let clicks = match last_click {
-                // A continuation must be the *same button*: a right-click right after a
-                // left triple-click is a new click, not a 4th press of the group.
-                Some((t, lx, ly, c, b))
-                    if b == button
-                        && now.duration_since(t) < MULTI_CLICK_INTERVAL
+                Some((t, lx, ly, c))
+                    if now.duration_since(t) < MULTI_CLICK_INTERVAL
                         && (x - lx).abs() <= MULTI_CLICK_DIST
                         && (y - ly).abs() <= MULTI_CLICK_DIST =>
                 {
@@ -246,50 +192,11 @@ fn record_loop(stop: Arc<AtomicBool>, running: Arc<AtomicBool>, events: Arc<Mute
                 }
                 _ => 1,
             };
-            last_click = Some((now, x, y, clicks, button));
+            last_click = Some((now, x, y, clicks));
             let delay_ms = stamp(&mut last_event);
-            // Resolve the click against the current windows and detect whether it landed in
-            // a window that wasn't open at the previous click (a just-appeared dialog/menu).
-            let windows = Window::all().unwrap_or_default();
-            let current_ids: HashSet<u32> = windows.iter().map(|w| w.id()).collect();
-            let target = windows.into_iter().find(|w| {
-                let (wx, wy, ww, wh) = (w.x(), w.y(), w.width() as i32, w.height() as i32);
-                ww > 0 && wh > 0 && x >= wx && x < wx + ww && y >= wy && y < wy + wh
-            });
-            let (win_id, off_x, off_y) = target
-                .map(|w| (w.id(), x - w.x(), y - w.y()))
-                .unwrap_or((0, 0, 0));
-            let wait_for_window = win_id != 0 && !prev_click_window_ids.contains(&win_id);
-            prev_click_window_ids = current_ids;
-            let ev = InputEvent::Click {
-                button,
-                win_id,
-                off_x,
-                off_y,
-                abs_x: x,
-                abs_y: y,
-                clicks,
-                wait_for_window,
-                // Filled in off-thread by the capture worker (see below).
-                patch: None,
-                delay_ms,
-            };
-            let idx = if let Ok(mut e) = events.lock() {
-                let idx = e.len();
+            let ev = resolve_click(button, x, y, clicks, delay_ms);
+            if let Ok(mut e) = events.lock() {
                 e.push(ev);
-                Some(idx)
-            } else {
-                None
-            };
-            // Capture the screen patch for image-verified replay on the worker thread, never
-            // inline: capture_image() takes hundreds of ms, and blocking this poll loop that
-            // long would miss the fast successive presses of a double/triple-click (collapsing
-            // it to a single click). Only the first click of a group needs a patch —
-            // continuations re-click its location at replay.
-            if clicks == 1 {
-                if let Some(idx) = idx {
-                    let _ = cap_tx.send((idx, x, y));
-                }
             }
         }
 
@@ -325,42 +232,23 @@ fn record_loop(stop: Arc<AtomicBool>, running: Arc<AtomicBool>, events: Arc<Mute
         prev_keys = keys;
         std::thread::sleep(POLL_INTERVAL);
     }
-    // Stop feeding the capture worker and wait for in-flight patches to finish, so the macro is
-    // complete (all patches attached) before stop_recording() reads it.
-    drop(cap_tx);
-    let _ = cap_handle.join();
     running.store(false, Ordering::Relaxed);
 }
 
-/// Captures a grayscale screen patch around the logical click point `(x, y)`, for
-/// image-verified replay. Converts the logical cursor coordinate into the capturing monitor's
-/// physical pixel space (via its scale factor), crops a [`PATCH_W`]×[`PATCH_H`] region centred
-/// on it (clamped at screen edges), and stores where the click sits inside that crop. Returns
-/// `None` if the monitor can't be found/captured or the usable crop is too small to match on.
-pub fn capture_click_patch(x: i32, y: i32) -> Option<ClickPatch> {
-    let monitor = Monitor::from_point(x, y).ok()?;
-    let scale = monitor.scale_factor().max(0.01);
-    let gray = DynamicImage::ImageRgba8(monitor.capture_image().ok()?).into_luma8();
-    let (iw, ih) = (gray.width() as i32, gray.height() as i32);
-    // Click point in the monitor image's physical pixels.
-    let px = (((x - monitor.x()) as f32) * scale).round() as i32;
-    let py = (((y - monitor.y()) as f32) * scale).round() as i32;
-    // Crop rectangle, centred on the click and clamped to the image.
-    let left = (px - PATCH_W as i32 / 2).clamp(0, (iw - 1).max(0));
-    let top = (py - PATCH_H as i32 / 2).clamp(0, (ih - 1).max(0));
-    let w = PATCH_W.min((iw - left).max(0) as u32);
-    let h = PATCH_H.min((ih - top).max(0) as u32);
-    if w < 16 || h < 16 {
-        return None;
+fn resolve_click(button: ClickButton, x: i32, y: i32, clicks: u8, delay_ms: u64) -> InputEvent {
+    let (win_id, off_x, off_y) = topmost_window_at(x, y)
+        .map(|w| (w.id(), x - w.x(), y - w.y()))
+        .unwrap_or((0, 0, 0));
+    InputEvent::Click {
+        button,
+        win_id,
+        off_x,
+        off_y,
+        abs_x: x,
+        abs_y: y,
+        clicks,
+        delay_ms,
     }
-    let patch = image::imageops::crop_imm(&gray, left as u32, top as u32, w, h).to_image();
-    Some(ClickPatch {
-        bytes: patch.into_raw(),
-        w,
-        h,
-        click_x: (px - left).clamp(0, w as i32 - 1) as u32,
-        click_y: (py - top).clamp(0, h as i32 - 1) as u32,
-    })
 }
 
 /// The topmost window containing the point. xcap returns windows front-to-back, so the
