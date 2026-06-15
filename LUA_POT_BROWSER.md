@@ -188,3 +188,74 @@ no mtime/size cache and no persistence.
 - Watch the interaction with content-hash-named previews: if a preset's content changes,
   its hash (and thus its preview file name) changes — the cache must invalidate the old
   entry, and ideally the redesign also addresses orphaned previews (no GC exists today).
+
+## Save-as name capture: window-relative action recorder (supersedes fixed positions)
+
+### Why the current model is wrong
+The upstream crawler scrapes a preset's name from the plug-in's "Save Preset As" dialog
+using two fixed screen coordinates (`SaveAsDialogScraping { save_as_button_pos,
+cancel_button_pos }`), and assumes: (a) one click opens the dialog, (b) the dialog's name
+field is focused so a blind select-all+copy works, and (c) the dialog is a detectable new
+OS window (`window_titles()` diff). All three break on real plug-ins — e.g. Serum reaches
+Save As through a menu (multi-click), may not auto-focus the field, and may draw an
+in-GUI dialog that is not a separate OS window. Fixed coordinates are also brittle to the
+window moving between record and replay.
+
+The overlay click-capture (used for the single Next-preset position) **cannot** record a
+sequence: it intercepts the click, so a menu never opens during capture. Recording an
+interactive multi-step flow requires observing the user's real clicks as they pass
+through to the plug-in.
+
+### Design: record window-relative input, replay relative
+Both primitives already exist as dependencies — no new crates:
+- `device_query` (already used by `base/src/mouse/enigo.rs`): polls global cursor
+  position + mouse-button state + key state. Source of click/keystroke events.
+- `xcap` (already used by the crawler's `window_titles()`): `Window::all()` exposes per
+  window `id()`, `app_name()`, `title()`, `x()/y()/width()/height()`. Source of window
+  identity + geometry.
+- `enigo` (already used): replay (synthesis).
+
+**Record** (Rust, on a dedicated high-rate poll thread so double-clicks / fast taps aren't
+missed): on each mouse-button down-edge, capture the click as window-relative — find the
+topmost `xcap` window under the cursor and store `{ window id, app_name, title,
+rect-at-capture, offset within window, button, timestamp }`. Capture key events with
+timestamps too. The user demonstrates the whole flow once on the real plug-in: open the
+menu, click Save As, focus the name field, select-all + copy, cancel.
+
+**Replay** (enigo): for each event, re-resolve the target window's *current* geometry via
+xcap, click at `current-origin + recorded-offset`, reproducing recorded delays. This
+survives the window being at a different position than during recording.
+
+This removes all three bad assumptions: arbitrary sequence (not single-click), the focus
+click is part of the recording (no auto-focus assumption), and open/close detection comes
+from diffing the xcap window-id set rather than titles. Crucially it does **not** assume
+the dialog is a native OS window: a plug-in-owned in-GUI dialog simply spawns no new id,
+so its clicks resolve relative to the plug-in's own window and replay still works. Native
+and custom-styled dialogs fall out of the same mechanism.
+
+### Honest caveats
+- **Transient dialog ids don't persist:** a dialog that opens/closes per preset gets a new
+  xcap id each time, so an id captured at record-time won't match at replay-time. The
+  stable anchor is the plug-in window (open for the whole crawl); clicks that landed in a
+  transient dialog are re-resolved at replay by heuristic ("the window that appeared after
+  the corresponding open-click", or match on app_name/title).
+- **macOS permissions:** xcap (window enumeration) likely needs Screen Recording
+  permission; device_query needs Accessibility. The existing crawler already uses xcap, so
+  this isn't new, but both must be granted once.
+- **Coordinate space:** device_query coordinates and xcap rects must share one global
+  pixel space; HiDPI / multi-monitor scaling is the usual trouble spot (same family as the
+  overlay's `PointConvertNative` conversion) — verify empirically.
+
+### Architecture
+The recorded event list lives in Rust (a recorder module in `pot-api`, or upstream in
+`pot`), never crossing into Lua. Lua drives it with simple control calls
+(`HB_Pot_CrawlerRecordStart/Stop/RecordedEventCount`), and `HB_Pot_CrawlerStart` consumes
+the stored recording when save-as mode is on (replacing the two fixed positions). Keep the
+fixed-position path working until the recorder is verified, so nothing regresses.
+
+### Proof of concept
+A standalone Rust binary (outside the workspace, `pot-input-poc/`) that depends only on
+`device_query` + `xcap` + `enigo` at the same versions, records window-relative clicks,
+then replays them — so the core record/resolve/replay loop and the coordinate-space
+question can be validated on the user's machine **without** REAPER or the pot stack. If the
+PoC replays correctly after moving the target window, integrate into the crawler.
