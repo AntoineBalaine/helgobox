@@ -29,8 +29,9 @@ palette, so it is deliberately out of scope.
 - [x] `HB_Pot_SupportsFilter(kind)` gating the sub-filters.
 - [x] `HB_Pot_IsFilterItemExcluded` / `SetFilterItemExcluded` (filter items dim when
   excluded; right-click to toggle).
-- [x] `HB_Pot_GetPresetPath` / `GetPreviewPath` — right-click preset to show in file
-  manager (SWS `CF_LocateInExplorer`, else copy path to clipboard).
+- [x] `HB_Pot_GetPresetPath` / `GetPreviewPath` — right-click preset to reveal the preset
+  file or the preview audio file in the system file manager. SWS `CF_LocateInExplorer` when
+  present, else a **native per-OS reveal** (no SWS dependency) — see *Post-parity refinements*.
 - [x] `HB_Pot_GetPresetContextName`.
 
 ### Group 3 — substantial new API + Lua — DONE (commits d6577ec6, 48613a5f, f4a783fd)
@@ -69,6 +70,43 @@ poll progress, handle failures. Recording stays in Rust
   user-customizable template like the egui version.
 - [x] Lua wizard: mode choice, preparing, ready, recording progress, done (failure list
   / export dir).
+
+## Post-parity refinements (2026-06-15)
+
+Changes on top of the parity work, after running the browser in REAPER (macOS).
+
+### Preset table: sortable columns (pure Lua, `lua/pot_browser.lua`)
+Clicking the **Name**, **FX**, or **Ext** header toggles ascending ↔ descending; **Prev** is
+not sortable. Implemented purely in Lua via the ImGui table `Sortable` flag +
+`TableGetColumnSortSpecs`, rendering the clipped rows through a display→engine index
+permutation (`sort_state` / `preset_sort_perm`). Cheap by construction: the engine already
+orders presets name-ascending, so Name/asc is the identity order and Name/desc is just the
+reversed index list (no data reads). FX (product) and Ext (file extension) read each preset's
+value once and cache the permutation on a signature, so it only rebuilds when the sort spec or
+the underlying preset list changes. Selection/highlight/load all map through the permutation, so
+the engine's preset index stays the source of truth (no new `HB_Pot_*` API needed).
+
+### Reveal preset / preview file in the system file manager — no SWS required
+The right-click "Show preset file" / "Show preview audio file" actions used to need the SWS
+extension (`CF_LocateInExplorer`) and silently fell back to *copying the path to the clipboard*
+without it. `reveal_in_file_manager` now prefers SWS when present but otherwise runs a native
+per-OS reveal: macOS `open -R`, Windows `explorer /select,`, Linux freedesktop
+`FileManager1.ShowItems` (with an `xdg-open` containing-folder fallback). Menu labels are
+OS-aware (`… in Finder/Explorer/file manager`). Items still appear only when the engine returns
+a path — a plug-in's internal/factory preset has no file on disk, so it shows no "preset file"
+item; "preview audio file" appears only when a recorded preview exists.
+
+### Bug fix: loading an FX preset removed the target FX (Rust, `pot/src/plugin_id.rs`)
+`content_formatted_for_reaper` formatted each of the four VST3 uid words with `{:X}` (no
+zero-padding), so a word with leading zeros lost digits. Serum's uid ends in a `0` word, so it
+formatted to a 25-char string instead of REAPER's real 32-char FX id
+(`56535458667358736572756D00000000`). The id comparison in `ensure_fx_has_correct_type` then
+failed, so loading a single-FX preset **removed** the (correct) destination FX and tried to
+re-insert via the same malformed id, which also failed — leaving an empty slot. Full RfxChain
+presets were unaffected (chunk replacement, no id comparison). Fixed by formatting each word with
+`{:08X}` (+ regression test using Serum's exact uid). The `i7zh34z{` prefix in the add-by-name
+string is **not** a bug — it is the intentional REAPER&lt;6.69 workaround
+(`reaper_add_by_name_prefix_fix`) plus the VST3 `{` delimiter.
 
 ## Status (2026-06-14)
 
