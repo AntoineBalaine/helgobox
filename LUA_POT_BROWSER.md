@@ -157,3 +157,34 @@ ReaScript, `APIdef_*` for the docs). Strings use caller buffers (Lua sees plain 
   preview-template resolution + render in the standalone context.
 - If the overlay capture doesn't overlay the plug-in window, switch the crawler capture
   to keypress-while-hovering (same coordinate path, no overlay).
+
+## Planned redesign: preview storage + scan cache
+
+These address real shortcomings in the upstream `pot` engine's preview/scan design
+(used unchanged today by both the egui browser and this standalone wrapper). They are
+**not** Lua-UI changes — they require modifying the `pot` crate or layering an alternative
+path in `pot-api`, and they diverge from how the original browser resolves previews, so
+we'd own the divergence.
+
+### 1. Embed preset identity as metadata in the preview file
+Today internal previews are anonymous: `…/Helgoboss/Pot/previews/aa/bb/<hash>.ogg`,
+named only by the preset's content hash, with no tags, no sidecar, no index. They are
+orphans to any external tool and carry no back-link to the preset.
+- Write the preset identity into the OGG as Vorbis comments (at minimum: preset name,
+  product/plugin, vendor, source database, persistent ID; ideally the content hash too).
+- Goal: external tools (sample browsers, DAW media explorers) can index and search the
+  previews, and a stray `.ogg` is self-describing rather than an orphan.
+
+### 2. Persistent scan cache (no re-hashing unchanged files)
+Today `DirectoryDatabase::refresh` walks the whole preset root and re-reads + re-hashes
+**every** file on every refresh, and `warm_up` runs that at each REAPER startup. There is
+no mtime/size cache and no persistence.
+- **Hard requirement:** assume a user's instrument/sample library may be hundreds of GB;
+  startup must stay fast. Re-hashing the whole library per launch is unacceptable.
+- Persist a scan cache keyed by `(path, mtime, size)` -> `(content_hash, detected
+  plugins)`. On refresh, only re-read files whose mtime/size changed; everything else is
+  served from the cache. Persist it across sessions (e.g. a small on-disk store in the
+  resource dir) so cold startup is incremental, not full.
+- Watch the interaction with content-hash-named previews: if a preset's content changes,
+  its hash (and thus its preview file name) changes — the cache must invalidate the old
+  entry, and ideally the redesign also addresses orphaned previews (no GC exists today).
