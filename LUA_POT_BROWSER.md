@@ -191,6 +191,12 @@ no mtime/size cache and no persistence.
 
 ## Save-as name capture: window-relative action recorder (supersedes fixed positions)
 
+**Implemented (commit 429eb0e3).** Recorder in `pot/src/preset_recorder.rs`; replay +
+verify-before-click in `pot/src/preset_crawler.rs` (`save_as_macro` on `CrawlPresetArgs`,
+takes precedence over the kept-for-egui `save_as_dialog`); `HB_Pot_CrawlerRecord*` API in
+`pot-api`; "record save-as actions" step in the Lua crawler wizard. macOS + Linux/X11
+keycode tables; physical-position replay via `enigo::Key::Raw`. Not yet run inside REAPER.
+
 ### Why the current model is wrong
 The upstream crawler scrapes a preset's name from the plug-in's "Save Preset As" dialog
 using two fixed screen coordinates (`SaveAsDialogScraping { save_as_button_pos,
