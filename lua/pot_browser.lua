@@ -650,7 +650,12 @@ local function crawler_record_ui(target, label, what)
   r.ImGui_Text(ctx, label)
   if recording and crawler.recording_target == target then
     r.ImGui_TextColored(ctx, 0xFF3030FF, string.format('  \u{25CF} RECORDING  %d actions', count))
-    r.ImGui_TextWrapped(ctx, '  ' .. what .. '   Then press ESC.')
+    r.ImGui_TextWrapped(ctx, '  ' .. what)
+    if r.ImGui_Button(ctx, '\u{25A0} Stop recording##stop' .. target) then
+      r.HB_Pot_CrawlerRecordStop()
+      crawler.recording_started = false
+      crawler.recording_target = nil
+    end
     return
   end
   if count > 0 then

@@ -134,11 +134,16 @@ pub fn stop_recording() -> RecordedMacro {
     if let Some(handle) = session.handle.take() {
         let _ = handle.join();
     }
-    let macro_events = session
+    let mut macro_events = session
         .events
         .lock()
         .map(|e| e.clone())
         .unwrap_or_default();
+    // The user stops recording by clicking the UI "Stop" button; that click is itself
+    // captured, so drop the trailing click.
+    if matches!(macro_events.last(), Some(InputEvent::Click { .. })) {
+        macro_events.pop();
+    }
     macro_events
 }
 
@@ -196,11 +201,13 @@ fn record_loop(stop: Arc<AtomicBool>, running: Arc<AtomicBool>, events: Arc<Mute
         }
 
         let keys: HashSet<Keycode> = device.get_keys().into_iter().collect();
-        // Escape ends recording (and is not itself recorded).
-        if keys.contains(&Keycode::Escape) && !prev_keys.contains(&Keycode::Escape) {
-            break;
-        }
+        // Escape is ignored entirely: it's not recorded (replaying it would close plug-in
+        // windows) and no longer stops recording (Esc closed the focused FX window, breaking
+        // the flow). Recording stops via the UI "Stop" button (the `stop` flag) or timeout.
         for k in keys.difference(&prev_keys) {
+            if *k == Keycode::Escape {
+                continue;
+            }
             if let Some(raw) = keycode_to_raw(*k) {
                 let delay_ms = stamp(&mut last_event);
                 if let Ok(mut e) = events.lock() {
@@ -209,6 +216,9 @@ fn record_loop(stop: Arc<AtomicBool>, running: Arc<AtomicBool>, events: Arc<Mute
             }
         }
         for k in prev_keys.difference(&keys) {
+            if *k == Keycode::Escape {
+                continue;
+            }
             if let Some(raw) = keycode_to_raw(*k) {
                 let delay_ms = stamp(&mut last_event);
                 if let Ok(mut e) = events.lock() {
