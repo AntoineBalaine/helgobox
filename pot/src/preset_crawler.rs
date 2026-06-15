@@ -1,4 +1,4 @@
-use crate::preset_recorder::{topmost_window_at, ClickButton, InputEvent, RecordedMacro};
+use crate::preset_recorder::{topmost_window_at, ClickButton, ClickPatch, InputEvent, RecordedMacro};
 use crate::{
     parse_vst2_magic_number, parse_vst3_uid, pot_db, EscapeCatcher, PersistentPresetId, PluginId,
 };
@@ -9,13 +9,61 @@ use base::{blocking_lock_arc, file_util, hash_util};
 use base::{Mouse, MouseCursorPosition};
 use camino::{Utf8Path, Utf8PathBuf};
 use helgobox_api::persistence::MouseButton;
+use image::DynamicImage;
+use imageproc::template_matching::{find_extremes, match_template, MatchTemplateMethod};
 use reaper_high::{Fx, FxInfo, Reaper};
+use std::collections::HashSet;
 use std::error::Error;
 use std::fs;
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
+
+/// Replay pacing. Each action waits the *recorded* inter-event delay before firing, so the
+/// macro paces itself the way it was demonstrated: a step that opens a menu/dialog keeps the
+/// pause the user left while it appeared (a human can't click a menu item before the menu has
+/// drawn, so the recorded delay is a safe lower bound for "the UI was visible"). The delay is
+/// clamped to a floor — so a brisk recording still leaves the UI time to draw a menu or
+/// right-click pop-up that is *not* a separate OS window (which the window-wait can't detect) —
+/// and a cap, so long human idle doesn't drag the crawl. Multi-click continuations (the 2nd/3rd
+/// press of a double/triple-click) bypass the floor so they stay within the OS multi-click
+/// interval. On top of this, a click into a just-appeared window additionally waits for that
+/// window to actually exist (see [`resolve_replay_target`]).
+const MIN_STEP_MS: u64 = 200;
+const MAX_STEP_MS: u64 = 1500;
+const DIALOG_POLL_MS: u64 = 15;
+const DIALOG_WAIT_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Image-**gated** replay (coordinate-first). Each recorded click carries a grayscale screen
+/// patch; at replay we click the *recorded coordinate* and use the patch only to wait until that
+/// image has reappeared **at that coordinate** (the menu/dialog has rendered). Windows don't move
+/// between record and replay, so the coordinate is authoritative — we never relocate the click to
+/// a best match elsewhere (which lands on similar-looking sibling menu rows). The patch replaces
+/// the old fixed delay with a real readiness signal while keeping coordinate accuracy. Knobs:
+/// - confirm presence within `MATCH_TOLERANCE` logical px of the recorded point (small: just
+///   enough to absorb rendering jitter; we are *checking*, not searching);
+/// - consider the target present when the normalized sum-of-squared-errors is below
+///   `MATCH_MAX_SSE` (0 = identical; same machine, so a rendered target scores near 0);
+/// - poll every `MATCH_POLL_MS` (a full-monitor screenshot per poll isn't cheap);
+/// - a target expected to be already present gives up after `MATCH_SETTLED_TIMEOUT` (then clicks
+///   the recorded coordinate anyway), whereas a `wait_for_window` click waits `DIALOG_WAIT_TIMEOUT`.
+const MATCH_TOLERANCE: i32 = 24;
+const MATCH_MAX_SSE: f32 = 0.20;
+const MATCH_POLL_MS: u64 = 60;
+const MATCH_SETTLED_TIMEOUT: Duration = Duration::from_millis(700);
+/// Match at 1/N resolution. Naive template matching is O(search-area × template-area), which
+/// is ~1.3 billion ops over a 480×480 region with a 120×72 patch — seconds per match in a debug
+/// build. Downscaling both by N cuts that by ~N⁴ and costs only ~N px of location precision
+/// (negligible for clicking a button/menu item).
+const MATCH_DOWNSCALE: u32 = 3;
+
+/// Crawler diagnostics, printed to **stdout** (REAPER is launched from a terminal while
+/// debugging the crawl). Kept to per-iteration / per-click granularity — never per poll — so it
+/// traces the flow without flooding. The `[pot-crawler]` prefix makes it greppable.
+fn crawl_log(msg: impl std::fmt::Display) {
+    println!("[pot-crawler] {msg}");
+}
 
 pub type SharedPresetCrawlingState = Arc<Mutex<PresetCrawlingState>>;
 
@@ -266,14 +314,26 @@ where
     let escape_catcher = EscapeCatcher::new();
     let mut chunks_file = tempfile::tempfile()?;
     let mut current_file_offset = 0u64;
+    let mut iteration = 0u32;
+    crawl_log(format!(
+        "crawl start: fx={:?}, never_stop={}, macros: next={} save_as={} save_preset={}",
+        fx_info.effect_name,
+        args.never_stop_crawling,
+        args.next_preset_macro.is_some(),
+        args.save_as_macro.is_some(),
+        args.save_preset_macro.is_some(),
+    ));
     loop {
         // Check if escape has been pressed
         if escape_catcher.escape_was_pressed() {
+            crawl_log("interrupted (escape)");
             return Ok(PresetCrawlingOutcome::new(
                 chunks_file,
                 PresetCrawlerStopReason::Interrupted,
             ));
         }
+        iteration += 1;
+        crawl_log(format!("--- iteration {iteration} ---"));
         // Get preset name. Preference: recorded macro > fixed-position scraping > host API.
         let scraped = if let Some(macro_events) = &args.save_as_macro {
             // Make sure the plug-in window is visible/front before replaying into it.
@@ -294,12 +354,14 @@ where
                 .into_string(),
             Some(ScrapedName::Name(name)) => name,
             Some(ScrapedName::Interrupted) => {
+                crawl_log("interrupted while scraping name");
                 return Ok(PresetCrawlingOutcome::new(
                     chunks_file,
                     PresetCrawlerStopReason::Interrupted,
                 ));
             }
         };
+        crawl_log(format!("preset name = {name:?}"));
         if let Some(save_macro) = &args.save_preset_macro {
             // Native-preset mode: dedup / detect end-of-list by NAME *before* saving, so a
             // wrap-around duplicate is never re-saved (which could trip REAPER's "overwrite?"
@@ -316,9 +378,14 @@ where
             let next_step = blocking_lock_arc(&args.state, "crawl native 2")
                 .add_preset(dummy, args.never_stop_crawling);
             if let NextCrawlStep::Stop(reason) = next_step {
+                crawl_log(format!("STOP: {reason:?} (captured {before} presets)"));
                 return Ok(PresetCrawlingOutcome::new(chunks_file, reason));
             }
             let is_new = blocking_lock_arc(&args.state, "crawl native 3").preset_count() > before;
+            crawl_log(format!(
+                "dedup: is_new={is_new}, preset_count {before} -> {}",
+                blocking_lock_arc(&args.state, "crawl native log").preset_count()
+            ));
             if is_new {
                 // The save macro pastes the name from the clipboard. After a name scrape it's
                 // already there; for host-provided names, put it there now.
@@ -326,7 +393,9 @@ where
                     set_clipboard_text(&name)?;
                 }
                 args.fx.show_in_floating_window()?;
-                if !replay_macro(&mut mouse, save_macro, &escape_catcher).await? {
+                crawl_log(format!("saving new preset {name:?}"));
+                if !replay_macro(&mut mouse, save_macro, &escape_catcher, "save-preset").await? {
+                    crawl_log("interrupted while saving preset");
                     return Ok(PresetCrawlingOutcome::new(
                         chunks_file,
                         PresetCrawlerStopReason::Interrupted,
@@ -365,6 +434,7 @@ where
                 .add_preset(crawled_preset, args.never_stop_crawling);
             match next_step {
                 NextCrawlStep::Stop(reason) => {
+                    crawl_log(format!("STOP: {reason:?}"));
                     return Ok(PresetCrawlingOutcome::new(chunks_file, reason));
                 }
                 NextCrawlStep::Continue => {}
@@ -373,8 +443,10 @@ where
         // Advance to the next preset: replay the recorded macro if present (verified,
         // window-relative), otherwise click the single captured position.
         args.fx.show_in_floating_window()?;
+        crawl_log("advancing to next preset");
         if let Some(next_macro) = &args.next_preset_macro {
-            if !replay_macro(&mut mouse, next_macro, &escape_catcher).await? {
+            if !replay_macro(&mut mouse, next_macro, &escape_catcher, "next-preset").await? {
+                crawl_log("interrupted while advancing");
                 return Ok(PresetCrawlingOutcome::new(
                     chunks_file,
                     PresetCrawlerStopReason::Interrupted,
@@ -464,42 +536,11 @@ fn find_window_by_id(id: u32) -> Option<xcap::Window> {
     xcap::Window::all().ok()?.into_iter().find(|w| w.id() == id)
 }
 
-/// Resolves a recorded click to absolute screen coordinates.
-///
-/// - Window still open: re-resolve its current position and **verify it's topmost** at the
-///   target point; abort if a different window covers it (never click the wrong window).
-/// - Window gone: it was transient (a dialog or context menu that reopens with a fresh id,
-///   e.g. a native save panel or a right-click "Copy" menu). Fall back to the recorded
-///   absolute position — it reopens at the same place.
-///
-/// xcap `Window` handles are dropped before returning (they may be `!Send`, so must not be
-/// held across the caller's await points).
-fn resolve_click_target(
-    win_id: u32,
-    off_x: i32,
-    off_y: i32,
-    abs_x: i32,
-    abs_y: i32,
-) -> Result<(i32, i32), Box<dyn Error + Send + Sync>> {
-    if win_id == 0 {
-        return Ok((abs_x, abs_y));
-    }
-    match find_window_by_id(win_id) {
-        Some(win) => {
-            let (tx, ty) = (win.x() + off_x, win.y() + off_y);
-            match topmost_window_at(tx, ty) {
-                Some(top) if top.id() == win_id => Ok((tx, ty)),
-                Some(top) => Err(format!(
-                    "expected window {win_id} at ({tx},{ty}) but '{}' is on top — aborting to \
-                     avoid clicking the wrong window",
-                    top.app_name()
-                )
-                .into()),
-                None => Err(format!("no window at ({tx},{ty}) during replay").into()),
-            }
-        }
-        None => Ok((abs_x, abs_y)),
-    }
+/// Snapshot of the currently-open window ids (empty if enumeration fails).
+fn current_window_ids() -> HashSet<u32> {
+    xcap::Window::all()
+        .map(|ws| ws.iter().map(|w| w.id()).collect())
+        .unwrap_or_default()
 }
 
 /// Posts a mouse click at `(x, y)` carrying the macOS multi-click state (1=single,
@@ -537,21 +578,76 @@ fn synth_click_macos(x: i32, y: i32, button: ClickButton, clicks: u8) {
     }
 }
 
+/// The recorded delay (ms since the previous event) for any event variant.
+fn event_delay_ms(ev: &InputEvent) -> u64 {
+    match ev {
+        InputEvent::Click { delay_ms, .. }
+        | InputEvent::KeyDown { delay_ms, .. }
+        | InputEvent::KeyUp { delay_ms, .. } => *delay_ms,
+    }
+}
+
+/// True for the 2nd/3rd press of a double/triple-click (`clicks > 1`): these must replay in
+/// quick succession to register as a multi-click, so they bypass the inter-action floor.
+fn is_multiclick_continuation(ev: &InputEvent) -> bool {
+    matches!(ev, InputEvent::Click { clicks, .. } if *clicks > 1)
+}
+
 /// Replays a recorded action macro. Returns `Ok(false)` if the user pressed Escape.
 ///
-/// Clicks are resolved/verified by [`resolve_click_target`]; keys replay by physical
-/// position (`Key::Raw`), which reproduces the user's keystrokes under any keyboard layout.
-/// Timing follows the recorded inter-event delays (with a fast down/up) so quick sequences
-/// like triple-clicks replay as triple-clicks rather than separate clicks.
+/// Paces each action by its recorded inter-event delay (clamped to [`MIN_STEP_MS`,
+/// `MAX_STEP_MS`]) so menus and pop-ups have time to appear, and before a click into a
+/// just-appeared window it additionally *waits for that dialog/menu to actually appear* (and
+/// anchors the click to it, wherever it reopened). Stable-window clicks are verified to be
+/// topmost first (abort if a different window covers the target). Keys replay by physical
+/// position; on macOS clicks carry the multi-click state.
 async fn replay_macro(
     mouse: &mut EnigoMouse,
     macro_events: &[InputEvent],
     escape_catcher: &EscapeCatcher,
+    label: &str,
 ) -> Result<bool, Box<dyn Error + Send + Sync>> {
-    for ev in macro_events {
+    crawl_log(format!(
+        "replay[{label}]: {} events",
+        macro_events.len()
+    ));
+    // The transient dialog/menu most recently waited for; subsequent clicks in it re-anchor here.
+    let mut tracked_dialog: Option<u32> = None;
+    // Window-id set captured before the *previous* action ran. When a click targets a
+    // just-appeared window, this is the set from before the click that opened it — so the
+    // dialog reads as "new" even if it appeared faster than we got here (snapshotting the
+    // baseline only once we're ready to wait would race the dialog already being up).
+    crawl_log(format!("replay[{label}] pre-loop: enumerating windows…"));
+    let mut ids_before_prev_action = current_window_ids();
+    crawl_log(format!(
+        "replay[{label}] pre-loop: {} windows",
+        ids_before_prev_action.len()
+    ));
+    // The location the previous click actually landed on, so a multi-click continuation
+    // re-clicks the exact same spot (keeping the OS multi-click together) without re-matching.
+    let mut last_click_pos: Option<(i32, i32)> = None;
+    for (idx, ev) in macro_events.iter().enumerate() {
         if escape_catcher.escape_was_pressed() {
+            crawl_log(format!("replay[{label}]: escape at event {idx}"));
             return Ok(false);
         }
+        let kind = match ev {
+            InputEvent::Click { .. } => "click",
+            InputEvent::KeyDown { .. } => "keydown",
+            InputEvent::KeyUp { .. } => "keyup",
+        };
+        // Multi-click continuations must stay fast (within the OS multi-click interval), so
+        // they skip the floor; every other action gets the floor so the UI it targets has had
+        // time to appear.
+        let delay_ms = if is_multiclick_continuation(ev) {
+            event_delay_ms(ev).min(MAX_STEP_MS)
+        } else {
+            event_delay_ms(ev).clamp(MIN_STEP_MS, MAX_STEP_MS)
+        };
+        crawl_log(format!("replay[{label}] event {idx} ({kind}): sleep {delay_ms}ms"));
+        millis(delay_ms).await;
+        crawl_log(format!("replay[{label}] event {idx}: enumerating windows…"));
+        let ids_before_this_action = current_window_ids();
         match ev {
             InputEvent::Click {
                 button,
@@ -561,16 +657,60 @@ async fn replay_macro(
                 abs_x,
                 abs_y,
                 clicks,
-                delay_ms,
+                wait_for_window,
+                patch,
+                ..
             } => {
-                millis((*delay_ms).min(5000)).await;
-                let (tx, ty) = resolve_click_target(*win_id, *off_x, *off_y, *abs_x, *abs_y)?;
+                let (tx, ty, how): (i32, i32, &str) = if is_multiclick_continuation(ev) {
+                    // Land exactly where the click it continues landed, so the OS still reads
+                    // them as one multi-click.
+                    let (x, y) = last_click_pos.unwrap_or((*abs_x, *abs_y));
+                    (x, y, "multiclick-continuation")
+                } else if let Some(p) = patch {
+                    // Coordinate-first, image-gated: click the RECORDED coordinate, using the
+                    // patch only to *wait until the recorded image reappears at that location*
+                    // (the menu/dialog has rendered). Windows don't move between record and
+                    // replay, so the recorded coordinate is authoritative — we never relocate
+                    // the click to a best-match elsewhere (which would land on a similar-looking
+                    // sibling menu row). The patch replaces the old fixed delay with a real
+                    // readiness signal while keeping coordinate accuracy.
+                    let timeout = if *wait_for_window {
+                        DIALOG_WAIT_TIMEOUT
+                    } else {
+                        MATCH_SETTLED_TIMEOUT
+                    };
+                    let ready = wait_for_patch(p, *abs_x, *abs_y, timeout, label, escape_catcher).await;
+                    let how = if ready { "image-gated" } else { "image-gate-timeout" };
+                    (*abs_x, *abs_y, how)
+                } else {
+                    // No patch captured (rare: capture failed). Fall back to window-relative
+                    // resolution / recorded absolute position.
+                    let (x, y) = resolve_replay_target(
+                        *win_id,
+                        *off_x,
+                        *off_y,
+                        *abs_x,
+                        *abs_y,
+                        *wait_for_window,
+                        &ids_before_prev_action,
+                        &mut tracked_dialog,
+                        escape_catcher,
+                    )
+                    .await?;
+                    (x, y, "resolve-no-patch")
+                };
+                crawl_log(format!(
+                    "replay[{label}] event {idx}: {:?} click (n={clicks}, wait_win={wait_for_window}, \
+                     patch={}) recorded@({abs_x},{abs_y}) -> ({tx},{ty}) via {how}",
+                    button,
+                    patch.is_some(),
+                ));
+                last_click_pos = Some((tx, ty));
                 let pos = MouseCursorPosition::new(tx.max(0) as u32, ty.max(0) as u32);
                 mouse.set_cursor_position(pos)?;
                 millis(12).await;
                 // On macOS the click must carry the multi-click state so the OS treats a
-                // recorded triple-click as a triple-click (enigo can't set it); elsewhere a
-                // plain click with the recorded timing suffices.
+                // recorded triple-click as a triple-click (enigo can't set it).
                 #[cfg(target_os = "macos")]
                 {
                     synth_click_macos(tx, ty, *button, *clicks);
@@ -587,17 +727,269 @@ async fn replay_macro(
                     mouse.release(b)?;
                 }
             }
-            InputEvent::KeyDown { raw, delay_ms } => {
-                millis((*delay_ms).min(5000)).await;
+            InputEvent::KeyDown { raw, .. } => {
+                crawl_log(format!("replay[{label}] event {idx}: key down raw={raw}"));
                 mouse.press_raw_key(*raw);
             }
-            InputEvent::KeyUp { raw, delay_ms } => {
-                millis((*delay_ms).min(5000)).await;
+            InputEvent::KeyUp { raw, .. } => {
+                crawl_log(format!("replay[{label}] event {idx}: key up raw={raw}"));
                 mouse.release_raw_key(*raw);
             }
         }
+        ids_before_prev_action = ids_before_this_action;
     }
     Ok(true)
+}
+
+/// Resolves where a recorded click should land:
+/// - stable window still open -> verify it's the topmost window there (abort otherwise);
+/// - a click into a just-appeared window (`wait_for_window`) -> wait for that dialog/menu and
+///   anchor to it; subsequent clicks in the same dialog re-anchor to it (so it tracks wherever
+///   the dialog reopened);
+/// - otherwise fall back to the recorded absolute position.
+#[allow(clippy::too_many_arguments)]
+async fn resolve_replay_target(
+    win_id: u32,
+    off_x: i32,
+    off_y: i32,
+    abs_x: i32,
+    abs_y: i32,
+    wait_for_window: bool,
+    baseline_ids: &HashSet<u32>,
+    tracked_dialog: &mut Option<u32>,
+    escape_catcher: &EscapeCatcher,
+) -> Result<(i32, i32), Box<dyn Error + Send + Sync>> {
+    if win_id != 0 {
+        if let Some(win) = find_window_by_id(win_id) {
+            let (tx, ty) = (win.x() + off_x, win.y() + off_y);
+            match topmost_window_at(tx, ty) {
+                Some(top) if top.id() == win_id => {}
+                Some(top) => {
+                    return Err(format!(
+                        "expected window {win_id} at ({tx},{ty}) but '{}' is on top — aborting \
+                         to avoid clicking the wrong window",
+                        top.app_name()
+                    )
+                    .into());
+                }
+                None => return Err(format!("no window at ({tx},{ty}) during replay").into()),
+            }
+            *tracked_dialog = None;
+            crawl_log("  resolve: stable window-relative");
+            return Ok((tx, ty));
+        }
+    }
+    // Transient window (reopened with a new id). Wait for it to appear if it's just opening.
+    if wait_for_window {
+        if let Some(id) = wait_for_new_window(baseline_ids, escape_catcher).await {
+            *tracked_dialog = Some(id);
+            crawl_log("  resolve: waited, new window appeared");
+        } else {
+            crawl_log("  resolve: waited, NO new window appeared");
+        }
+    }
+    if let Some((dx, dy)) = (*tracked_dialog)
+        .and_then(find_window_by_id)
+        .map(|d| (d.x() + off_x, d.y() + off_y))
+    {
+        crawl_log("  resolve: transient-dialog anchor");
+        return Ok((dx, dy));
+    }
+    crawl_log("  resolve: recorded absolute position");
+    Ok((abs_x, abs_y))
+}
+
+/// Polls for a window absent from `baseline` (the dialog/menu the opener click is bringing
+/// up) to appear, returning its id. `baseline` is the window set from *before* the opener
+/// click, so a dialog that already appeared still reads as new and is found on the first poll;
+/// a slow one is waited for. Returns None on timeout or Escape. (xcap windows are turned into
+/// ids immediately so no `!Send` handle is held across an await.)
+async fn wait_for_new_window(
+    baseline: &HashSet<u32>,
+    escape_catcher: &EscapeCatcher,
+) -> Option<u32> {
+    let start = Instant::now();
+    loop {
+        if escape_catcher.escape_was_pressed() {
+            return None;
+        }
+        if let Ok(windows) = xcap::Window::all() {
+            if let Some(id) = windows.iter().map(|w| w.id()).find(|id| !baseline.contains(id)) {
+                return Some(id);
+            }
+        }
+        if start.elapsed() >= DIALOG_WAIT_TIMEOUT {
+            return None;
+        }
+        millis(DIALOG_POLL_MS).await;
+    }
+}
+
+/// Checks whether the recorded click patch is present **at** its recorded position, returning the
+/// best normalized-SSE score (lower = better) within a small [`MATCH_TOLERANCE`] window around it,
+/// or `None` if the screen couldn't be captured. This is a presence test, not a search: the
+/// caller clicks the recorded coordinate, never a relocated best-match. All xcap/image handles are
+/// dropped before returning, so no `!Send` value is held across the caller's await points.
+fn match_patch_on_screen(patch: &ClickPatch, exp_x: i32, exp_y: i32) -> Option<f32> {
+    crawl_log(format!("  [capture-thread] Monitor::from_point({exp_x},{exp_y})…"));
+    let monitor = match xcap::Monitor::from_point(exp_x, exp_y) {
+        Ok(m) => m,
+        Err(e) => {
+            crawl_log(format!("  [capture-thread] from_point failed: {e}"));
+            return None;
+        }
+    };
+    let scale = monitor.scale_factor().max(0.01);
+    crawl_log(format!(
+        "  [capture-thread] monitor @({},{}) {}x{} scale {scale}; capture_image()…",
+        monitor.x(),
+        monitor.y(),
+        monitor.width(),
+        monitor.height(),
+    ));
+    let rgba = match monitor.capture_image() {
+        Ok(img) => img,
+        Err(e) => {
+            crawl_log(format!("  [capture-thread] capture_image failed: {e}"));
+            return None;
+        }
+    };
+    crawl_log(format!(
+        "  [capture-thread] captured {}x{}; matching…",
+        rgba.width(),
+        rgba.height()
+    ));
+    let gray = DynamicImage::ImageRgba8(rgba).into_luma8();
+    let (iw, ih) = (gray.width() as i32, gray.height() as i32);
+    // Search only a small tolerance window *centred on the recorded click point*, in physical
+    // pixels. The patch was captured centred on the click (its click point is at click_x/click_y
+    // inside it), so aligning the patch's click point to the recorded location puts the patch
+    // top-left at (epx - click_x, epy - click_y); we widen by `tol` on every side so the match
+    // can slide a little to absorb rendering jitter.
+    let epx = (((exp_x - monitor.x()) as f32) * scale).round() as i32;
+    let epy = (((exp_y - monitor.y()) as f32) * scale).round() as i32;
+    let tol = (MATCH_TOLERANCE as f32 * scale).round() as i32;
+    let sx = (epx - patch.click_x as i32 - tol).clamp(0, (iw - 1).max(0));
+    let sy = (epy - patch.click_y as i32 - tol).clamp(0, (ih - 1).max(0));
+    let sw = (patch.w as i32 + 2 * tol).min(iw - sx).max(0) as u32;
+    let sh = (patch.h as i32 + 2 * tol).min(ih - sy).max(0) as u32;
+    // match_template panics unless the template is strictly smaller than the searched image.
+    if sw <= patch.w || sh <= patch.h {
+        return None;
+    }
+    let region = image::imageops::crop_imm(&gray, sx as u32, sy as u32, sw, sh).to_image();
+    let template = image::GrayImage::from_raw(patch.w, patch.h, patch.bytes.clone())?;
+    // Match at reduced resolution (see MATCH_DOWNSCALE). Same filter on both keeps them aligned.
+    let ds = MATCH_DOWNSCALE.max(1);
+    let (rw, rh) = (region.width() / ds, region.height() / ds);
+    let (tw, th) = (template.width() / ds, template.height() / ds);
+    if tw == 0 || th == 0 || rw <= tw || rh <= th {
+        return None;
+    }
+    let region = image::imageops::resize(&region, rw, rh, image::imageops::FilterType::Triangle);
+    let template =
+        image::imageops::resize(&template, tw, th, image::imageops::FilterType::Triangle);
+    let t = Instant::now();
+    let scores = match_template(
+        &region,
+        &template,
+        MatchTemplateMethod::SumOfSquaredErrorsNormalized,
+    );
+    let best = find_extremes(&scores).min_value;
+    crawl_log(format!(
+        "  [capture-thread] match done in {}ms (1/{ds} scale, region {rw}x{rh}), best score {:.3}",
+        t.elapsed().as_millis(),
+        best,
+    ));
+    Some(best)
+}
+
+/// Runs [`match_patch_on_screen`] on a throwaway background thread and awaits the score.
+///
+/// The screen grab + template match is heavy (a full-monitor `capture_image()` plus matching),
+/// and the crawl future runs on REAPER's main thread, pumped once per frame — doing this work
+/// inline would stall REAPER's UI for the duration of every poll. Running it on a worker thread
+/// and polling for the result keeps the main loop responsive. Only the `Send` score crosses back,
+/// so no `!Send` xcap handle escapes the worker.
+async fn capture_and_match(patch: &ClickPatch, exp_x: i32, exp_y: i32) -> Option<f32> {
+    let patch = patch.clone();
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(match_patch_on_screen(&patch, exp_x, exp_y));
+    });
+    loop {
+        match rx.try_recv() {
+            Ok(result) => return result,
+            Err(std::sync::mpsc::TryRecvError::Empty) => millis(10).await,
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => return None,
+        }
+    }
+}
+
+/// Polls [`capture_and_match`] until the recorded patch is present at the recorded location
+/// (score within threshold) or `timeout` elapses (or Escape), logging the best score on the way.
+/// Returns `true` if the target was confirmed present, `false` on timeout/Escape — either way the
+/// caller clicks the recorded coordinate; this just decides *when* (after the menu/dialog renders).
+async fn wait_for_patch(
+    patch: &ClickPatch,
+    exp_x: i32,
+    exp_y: i32,
+    timeout: Duration,
+    label: &str,
+    escape_catcher: &EscapeCatcher,
+) -> bool {
+    crawl_log(format!(
+        "replay[{label}] patch gate begin at ({exp_x},{exp_y}), capturing screen (timeout {}ms)…",
+        timeout.as_millis()
+    ));
+    let start = Instant::now();
+    let mut best = f32::INFINITY;
+    let mut polls = 0u32;
+    let mut logged_capture_fail = false;
+    loop {
+        if escape_catcher.escape_was_pressed() {
+            return false;
+        }
+        polls += 1;
+        match capture_and_match(patch, exp_x, exp_y).await {
+            Some(score) => {
+                if score < best {
+                    best = score;
+                }
+                if score <= MATCH_MAX_SSE {
+                    crawl_log(format!(
+                        "replay[{label}] patch {}x{} present at ({exp_x},{exp_y}) \
+                         score {score:.3} (<= {MATCH_MAX_SSE}) after {polls} poll(s), {} ms",
+                        patch.w,
+                        patch.h,
+                        start.elapsed().as_millis(),
+                    ));
+                    return true;
+                }
+            }
+            None => {
+                // Log once per click: a persistent failure floods otherwise.
+                if !logged_capture_fail {
+                    logged_capture_fail = true;
+                    crawl_log(format!(
+                        "replay[{label}] patch search failed (no monitor capture / region too \
+                         small) near ({exp_x},{exp_y})"
+                    ));
+                }
+            }
+        }
+        if start.elapsed() >= timeout {
+            crawl_log(format!(
+                "replay[{label}] patch {}x{} NOT present at ({exp_x},{exp_y}) after {} ms \
+                 ({polls} polls); best score {best:.3} > {MATCH_MAX_SSE} -> clicking recorded coord anyway",
+                patch.w,
+                patch.h,
+                start.elapsed().as_millis(),
+            ));
+            return false;
+        }
+        millis(MATCH_POLL_MS).await;
+    }
 }
 
 /// Replays a recorded save-as macro, then reads the preset name from the clipboard.
@@ -608,11 +1000,12 @@ async fn replay_macro_and_scrape(
 ) -> Result<ScrapedName, Box<dyn Error + Send + Sync>> {
     // Sentinel so we can tell whether the copy actually happened.
     set_clipboard_text(CLIPBOARD_SENTINEL)?;
-    if !replay_macro(mouse, macro_events, escape_catcher).await? {
+    if !replay_macro(mouse, macro_events, escape_catcher, "scrape").await? {
         return Ok(ScrapedName::Interrupted);
     }
     a_bit_longer().await;
     let name = clipboard_text()?;
+    crawl_log(format!("scrape: clipboard = {name:?}"));
     if name == CLIPBOARD_SENTINEL {
         return Err("the recorded actions didn't copy a preset name to the clipboard".into());
     }

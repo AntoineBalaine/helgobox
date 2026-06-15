@@ -32,6 +32,10 @@ riff-io.workspace = true
 rusqlite = { workspace = true, features = ["bundled"] }
 # For detecting the appearance of plug-in "Save Preset As" dialogs (preset crawler)
 xcap.workspace = true
+# For image-verified click replay: capture a patch around each recorded click and locate it
+# on screen at replay time (template matching), so clicks wait for and hit menus/dialogs.
+image.workspace = true
+imageproc.workspace = true
 # For reading the preset name that the crawler copies out of "Save Preset As" dialogs
 arboard.workspace = true
 # For the save-as action recorder: polling global mouse/keyboard during recording

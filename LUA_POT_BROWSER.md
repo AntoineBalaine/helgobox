@@ -203,17 +203,34 @@ saves **native REAPER FX presets** rather than `.RfxChain` files.
   captures clicks (stored window-relative: the xcap window id under the cursor + offset,
   with an absolute fallback) and keystrokes (stored as the platform raw keycode). It also
   records the **multi-click count** (timing+position) so a triple-click can replay as a real
-  triple-click. Recording **stops via the UI button** (not Escape — Escape closed the FX
-  window and is now ignored and never recorded). The trailing click (the user clicking
-  "Stop") is dropped from the macro.
-- **Replay** (`pot/src/preset_crawler.rs`): clicks are **verified before firing** — the
-  recorded window is re-resolved and must be the topmost window at the target point, else
-  the crawl aborts rather than click the wrong window. A click whose window is **gone**
-  (a transient dialog/menu that reopened with a new id) falls back to its recorded absolute
-  position. Keys replay by **physical position** (`enigo::Key::Raw`) so they're
-  layout-independent (bépo etc.); on macOS clicks are posted via **core-graphics** carrying
-  the multi-click state (enigo only ever posts click-state 1). Timing reproduces the
-  recorded inter-event delays (capped), so triple-clicks and dialog waits replay correctly.
+  triple-click. Each click is also tagged **`wait_for_window`** — true when it landed in a
+  window that wasn't open at the *previous* click, i.e. a dialog/menu that just appeared; this
+  is what drives the event-driven wait on replay. Recording **stops via the UI button** (not
+  Escape — Escape closed the FX window and is now ignored and never recorded). The trailing
+  click (the user clicking "Stop") is dropped from the macro.
+- **Replay** (`pot/src/preset_crawler.rs`): **image-verified clicks** are the primary
+  mechanism, with recorded-delay pacing and window waits as backstops. At record time each
+  click stores a small grayscale screen patch around it (`ClickPatch`, captured via
+  `xcap::Monitor::capture_image`, in physical pixels — only for the first click of a group; a
+  multi-click continuation re-clicks the first click's exact spot). At replay, before each
+  click, we screenshot a `MATCH_SEARCH_RADIUS` window around the recorded position and
+  template-match the patch (`imageproc::template_matching::match_template` +
+  `find_extremes`, normalized sum-of-squared-errors below `MATCH_MAX_SSE`), **polling until it
+  appears** and then clicking *where it was found*. This is the one mechanism that both waits
+  for the target to render and lands on it wherever it ended up, and it works for in-view
+  menus, separate-window menus, and native dialogs alike (no dependency on a menu being an
+  enumerable OS window). A `wait_for_window` click polls up to `DIALOG_WAIT_TIMEOUT`; an
+  already-present target gives up after `MATCH_SETTLED_TIMEOUT` and falls back. **Fallback
+  chain** when the patch isn't found (or there is none): still-open recorded window →
+  verified topmost window-relative (abort if a different window covers the point); transient
+  window → re-anchor to the dialog the window-wait detected; finally the recorded absolute
+  position. Pacing still applies: each action first waits its *recorded* inter-event delay
+  (clamped to `[MIN_STEP_MS, MAX_STEP_MS]`; multi-click continuations bypass the floor), which
+  paces keystrokes and gives the UI a head start before the first screenshot. Keys replay by
+  **physical position** (`enigo::Key::Raw`) so they're layout-independent (bépo etc.); on
+  macOS clicks are posted via **core-graphics** carrying the multi-click state (enigo only
+  ever posts click-state 1). The image-matching deps (`image`, `imageproc`, `xcap` capture)
+  were already compiled into the workspace — no new dependency was added.
 - **Three macros** (`CrawlPresetArgs`: `next_preset_macro`, `save_as_macro`,
   `save_preset_macro`): (1) Next-preset click, (2) Scrape-name — plug-in Save-As ->
   triple-click -> copy -> cancel — only when the plug-in hides names, (3) Save-preset —
@@ -232,15 +249,24 @@ saves **native REAPER FX presets** rather than `.RfxChain` files.
 Validated first in a standalone PoC (`pot-input-poc/`), then in REAPER.
 
 ### Open items / known limitations
-- **Transient-dialog position drift:** clicks inside a dialog that reopens with a new window
-  id replay by *absolute* position, so they miss if the dialog reopens at a different spot
-  (suspected on Serum's native save-panel Cancel button). Fix if confirmed: anchor such
-  clicks to the current topmost window (the reopened dialog) + recorded offset.
-- **Replay speed:** the per-action delays are the *recorded* inter-event timings, so the
-  replay runs at the pace the macro was recorded at — brisk recording = fast crawl. A speed
-  factor / lower delay cap could trim long human pauses (watch dialog-appearance waits).
+- **Image-verified replay — needs verification on the Mac.** This is the fix for clicks that
+  fired before a context-menu item (e.g. "Copy") rendered, or at a drifted position. Confirm:
+  (a) a recorded patch matches reliably (tune `MATCH_MAX_SSE` if matches are missed or false);
+  (b) the **HiDPI coordinate math** — the recorder/replayer convert logical `device_query`
+  coordinates to/from the monitor's physical capture pixels via `scale_factor`; this is the
+  classic multi-monitor/Retina trouble spot and is only verifiable empirically.
+- **Dynamic-content patches fall back slowly.** If a captured patch includes text that changes
+  per preset (e.g. a Next-preset button patch that caught the preset name), it won't match on
+  later presets and the click waits `MATCH_SETTLED_TIMEOUT` before falling back to the
+  (correct) window/coordinate path — correctness holds, but it adds that delay per preset. Fix
+  by re-recording the click so the patch sits on static chrome, or lowering the timeout.
+- **Full-monitor screenshot per poll.** `xcap` 0.0.13 has no region capture, so each match
+  poll grabs the whole monitor (heavy on Retina); poll interval is therefore coarse
+  (`MATCH_POLL_MS`). Found-on-first-poll is the common case; the cost only bites when a patch
+  never matches (waits out the timeout).
 - **macOS click-state path** is `cfg`-gated (core-graphics), so it's only compiled/verified
-  on the Mac, not by the Linux `cargo check`.
+  on the Mac, not by the Linux `cargo check`. The event-driven waits (xcap window polling) are
+  cross-platform but likewise only behavior-verified on the Mac.
 
 ### Why the current model is wrong
 The upstream crawler scrapes a preset's name from the plug-in's "Save Preset As" dialog

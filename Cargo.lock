@@ -4885,6 +4885,8 @@ dependencies = [
  "enumset",
  "futures",
  "helgobox-api",
+ "image 0.25.2",
+ "imageproc 0.25.0",
  "itertools",
  "lexical-sort",
  "nanoid",
