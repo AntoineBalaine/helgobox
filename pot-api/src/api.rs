@@ -397,6 +397,78 @@ unsafe extern "C" fn vararg_HB_Pot_DarkModeEnabled(_: *mut *mut c_void, _: c_int
     ret_int(HB_Pot_DarkModeEnabled())
 }
 
+// ---------------------------------------------------------------------------
+// Preview transport (play/pause/seek/loop + position) for the waveform UI
+// ---------------------------------------------------------------------------
+
+extern "C" fn HB_Pot_PausePreview() {
+    with_pot_unit(|_, unit| {
+        let _ = unit.pause_preview();
+    });
+}
+unsafe extern "C" fn vararg_HB_Pot_PausePreview(_: *mut *mut c_void, _: c_int) -> *mut c_void {
+    HB_Pot_PausePreview();
+    std::ptr::null_mut()
+}
+
+extern "C" fn HB_Pot_ResumePreview() {
+    with_pot_unit(|_, unit| {
+        let _ = unit.resume_preview();
+    });
+}
+unsafe extern "C" fn vararg_HB_Pot_ResumePreview(_: *mut *mut c_void, _: c_int) -> *mut c_void {
+    HB_Pot_ResumePreview();
+    std::ptr::null_mut()
+}
+
+extern "C" fn HB_Pot_IsPreviewPlaying() -> c_int {
+    with_pot_unit(|_, unit| unit.is_preview_playing() as c_int).unwrap_or(0)
+}
+unsafe extern "C" fn vararg_HB_Pot_IsPreviewPlaying(_: *mut *mut c_void, _: c_int) -> *mut c_void {
+    ret_int(HB_Pot_IsPreviewPlaying())
+}
+
+extern "C" fn HB_Pot_GetPreviewPosition() -> c_int {
+    with_pot_unit(|_, unit| (unit.preview_position() * 1000.0).round() as c_int).unwrap_or(-1)
+}
+unsafe extern "C" fn vararg_HB_Pot_GetPreviewPosition(_: *mut *mut c_void, _: c_int) -> *mut c_void {
+    ret_int(HB_Pot_GetPreviewPosition())
+}
+
+extern "C" fn HB_Pot_GetPreviewLength() -> c_int {
+    with_pot_unit(|_, unit| (unit.preview_length() * 1000.0).round() as c_int).unwrap_or(0)
+}
+unsafe extern "C" fn vararg_HB_Pot_GetPreviewLength(_: *mut *mut c_void, _: c_int) -> *mut c_void {
+    ret_int(HB_Pot_GetPreviewLength())
+}
+
+extern "C" fn HB_Pot_SeekPreview(pos_ms: c_int) {
+    with_pot_unit(|_, unit| {
+        let _ = unit.seek_preview((pos_ms.max(0) as f64) / 1000.0);
+    });
+}
+unsafe extern "C" fn vararg_HB_Pot_SeekPreview(args: *mut *mut c_void, n: c_int) -> *mut c_void {
+    HB_Pot_SeekPreview(int_arg(args, n, 0));
+    std::ptr::null_mut()
+}
+
+extern "C" fn HB_Pot_GetPreviewLooped() -> c_int {
+    with_pot_unit(|_, unit| unit.is_preview_looped() as c_int).unwrap_or(0)
+}
+unsafe extern "C" fn vararg_HB_Pot_GetPreviewLooped(_: *mut *mut c_void, _: c_int) -> *mut c_void {
+    ret_int(HB_Pot_GetPreviewLooped())
+}
+
+extern "C" fn HB_Pot_SetPreviewLooped(on: c_int) {
+    with_pot_unit(|_, unit| {
+        let _ = unit.set_preview_looped(on != 0);
+    });
+}
+unsafe extern "C" fn vararg_HB_Pot_SetPreviewLooped(args: *mut *mut c_void, n: c_int) -> *mut c_void {
+    HB_Pot_SetPreviewLooped(int_arg(args, n, 0));
+    std::ptr::null_mut()
+}
+
 extern "C" fn HB_Pot_StopPreview() {
     with_pot_unit(|_, unit| {
         let _ = unit.stop_preview();
@@ -1816,6 +1888,14 @@ macro_rules! paste_vararg {
     (HB_Pot_DbDeleteOrphan) => { vararg_HB_Pot_DbDeleteOrphan };
     (HB_Pot_DbPruneRegistry) => { vararg_HB_Pot_DbPruneRegistry };
     (HB_Pot_DbRebuildIndex) => { vararg_HB_Pot_DbRebuildIndex };
+    (HB_Pot_PausePreview) => { vararg_HB_Pot_PausePreview };
+    (HB_Pot_ResumePreview) => { vararg_HB_Pot_ResumePreview };
+    (HB_Pot_IsPreviewPlaying) => { vararg_HB_Pot_IsPreviewPlaying };
+    (HB_Pot_GetPreviewPosition) => { vararg_HB_Pot_GetPreviewPosition };
+    (HB_Pot_GetPreviewLength) => { vararg_HB_Pot_GetPreviewLength };
+    (HB_Pot_SeekPreview) => { vararg_HB_Pot_SeekPreview };
+    (HB_Pot_GetPreviewLooped) => { vararg_HB_Pot_GetPreviewLooped };
+    (HB_Pot_SetPreviewLooped) => { vararg_HB_Pot_SetPreviewLooped };
 }
 
 fn pot_api_fns() -> Vec<PotApiFn> {
@@ -2014,6 +2094,22 @@ fn pot_api_fns() -> Vec<PotApiFn> {
             b"int\0\0\0Removes preview registry rows whose file no longer exists on disk (e.g. deleted outside pot), keeping the has-preview filter accurate. Returns the number of rows pruned.\0";
         HB_Pot_DbRebuildIndex:
             b"int\0\0\0Rebuilds the preview registry from the .ogg files on disk: derives each preview's hash from its filename and reads its embedded Vorbis metadata. Doubles as the one-time adoption pass for previews that predate the registry (so they are not mistaken for orphans). Returns the number of files registered.\0";
+        HB_Pot_PausePreview:
+            b"void\0\0\0Pauses preview playback, keeping the current position so resuming continues from there (unlike stopping, which rewinds).\0";
+        HB_Pot_ResumePreview:
+            b"void\0\0\0Resumes preview playback from the current position (no-op if already playing).\0";
+        HB_Pot_IsPreviewPlaying:
+            b"int\0\0\0Returns 1 if a preview is currently playing. Stays 1 after a non-looped preview reaches its end until you stop or pause it.\0";
+        HB_Pot_GetPreviewPosition:
+            b"int\0\0\0Returns the current preview playback position in milliseconds, or -1 if unavailable.\0";
+        HB_Pot_GetPreviewLength:
+            b"int\0\0\0Returns the length of the loaded preview in milliseconds, or 0 if unknown.\0";
+        HB_Pot_SeekPreview:
+            b"void\0int\0position_ms\0Seeks preview playback to the given position in milliseconds (clamped to the preview length).\0";
+        HB_Pot_GetPreviewLooped:
+            b"int\0\0\0Returns 1 if preview playback is set to loop.\0";
+        HB_Pot_SetPreviewLooped:
+            b"void\0int\0on\0Enables (on=1) or disables (on=0) looped preview playback.\0";
     ]
 }
 

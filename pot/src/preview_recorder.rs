@@ -12,7 +12,9 @@ use base::{blocking_lock_arc, blocking_write_lock, file_util};
 use camino::{Utf8Path, Utf8PathBuf};
 use helgobox_api::persistence::PotFilterKind;
 use reaper_high::{Project, Reaper};
-use reaper_medium::{CommandId, OpenProjectBehavior, ProjectContext, ProjectInfoAttributeKey};
+use reaper_medium::{
+    CommandId, MidiImportBehavior, OpenProjectBehavior, ProjectContext, ProjectInfoAttributeKey,
+};
 use std::error::Error;
 use std::sync::{Arc, RwLock};
 
@@ -160,6 +162,9 @@ fn register_recorded_preview(preset: &crate::PotPreset, preview_file_path: &Utf8
         .map(|d| d.as_secs() as i64)
         .unwrap_or(0);
     write_preview_vorbis_comments(preview_file_path, preset, &preview_hash);
+    // Build REAPER's peak cache now, so the browser's waveform is an instant GetPeaks read
+    // rather than an on-the-fly build while the user is browsing.
+    build_preview_peaks(preview_file_path);
     let row = crate::db::PreviewRow {
         preview_hash,
         file_path: file_util::convert_hash_to_dir_structure(hash, ".ogg"),
@@ -220,6 +225,38 @@ fn write_preview_vorbis_comments(
     if let Err(e) = tag.save_to_path(preview_file_path.as_std_path(), WriteOptions::default()) {
         tracing::warn!("failed to write preview Vorbis comments to {preview_file_path}: {e}");
     }
+}
+
+/// Builds REAPER's peak cache for the just-recorded preview, so the browser can draw its
+/// waveform with an instant `GetPeaks` read instead of building peaks on the fly while the
+/// user browses (see `POT_DB_DESIGN.md`). REAPER persists the result in its own peak-cache
+/// directory; we only need to trigger the build here.
+///
+/// Best-effort: a failure to build peaks just means the browser falls back to building them
+/// on first view, so it never affects the recording.
+fn build_preview_peaks(preview_file_path: &Utf8Path) {
+    let reaper = Reaper::get();
+    let Ok(source) = reaper
+        .medium_reaper()
+        .pcm_source_create_from_file_ex(preview_file_path, MidiImportBehavior::UsePreference)
+    else {
+        return;
+    };
+    // SAFETY: `source` is a freshly created, valid PCM source that outlives the calls below,
+    // and `PCM_Source_BuildPeaks` only reads/builds peaks for it. The mode sequence is REAPER's
+    // documented incremental build: 0 = start, 1 = build a chunk (returns non-zero while more
+    // remains), 2 = finish. The iteration guard bounds it against a misbehaving source.
+    let raw = source.as_ptr().as_ptr();
+    let low = reaper.medium_reaper().low();
+    unsafe {
+        low.PCM_Source_BuildPeaks(raw, 0);
+        let mut guard = 0;
+        while low.PCM_Source_BuildPeaks(raw, 1) != 0 && guard < 1_000_000 {
+            guard += 1;
+        }
+        low.PCM_Source_BuildPeaks(raw, 2);
+    }
+    // `source` (OwnedPcmSource) is dropped and destroyed here.
 }
 
 fn render_to_file(project: Project, full_path: &Utf8Path) -> Result<(), Box<dyn Error>> {

@@ -53,6 +53,25 @@ local focus_search_on_next_frame = false
 local auto_preview = true
 local volume_before_mute = nil -- non-nil while muted
 
+-- Waveform preview. Peaks for the selected preset's preview are computed via REAPER's
+-- GetPeaks (debounced after the selection settles, so hammering "next" never triggers work)
+-- and cached here for the currently displayed preset. Recorded previews already have their
+-- peaks built at record time, so the read is instant; the BuildPeaks fallback in compute_peaks
+-- only fires for the occasional preview whose peaks aren't built yet.
+local WAVE_BUCKETS = 480
+local WAVE_HEIGHT = 80
+local WAVE_DEBOUNCE = 0.12 -- seconds the selection must settle before we compute peaks
+local wave = {
+  last_sel = nil,       -- last selected index we reacted to
+  index = nil,          -- preset index the cached peaks belong to
+  peaks = nil,          -- array of { mn, mx } per bucket, channels mixed
+  pending_index = nil,  -- index waiting out the debounce
+  pending_at = 0,       -- time_precise() when the pending selection was set
+}
+-- `paused` distinguishes "paused mid-preview" (resume continues) from "stopped/fresh"
+-- (play starts the selected preset from the beginning).
+local transport = { paused = false }
+
 -- Preset table sorting. The engine always orders presets name-ascending, so Name/asc is the
 -- identity order and Name/desc is just the reversed index list (no data reads). FX (product)
 -- sorting reads each preset's product and is cached on a cheap signature so it only rebuilds
@@ -1091,6 +1110,141 @@ local function maintenance_render()
   if not open then maintenance_close() end
 end
 
+-- Compute a channels-mixed min/max peak array for an audio file using REAPER's peak engine.
+-- Returns an array of { mn, mx } (one per bucket) or nil. If the peaks aren't built yet
+-- (a cold, non-recorded preview), it drives BuildPeaks to completion once and re-reads; this
+-- only happens post-debounce on a single file, so it never stutters rapid browsing.
+local function compute_peaks(path, buckets)
+  local src = r.PCM_Source_CreateFromFile(path)
+  if not src then return nil end
+  local length = r.GetMediaSourceLength(src)
+  local nch = r.GetMediaSourceNumChannels(src)
+  if length <= 0 or nch <= 0 then r.PCM_Source_Destroy(src) return nil end
+  local peakrate = buckets / length
+  local function read()
+    local buf = r.new_array(nch * buckets * 2) -- maximums block, then minimums block
+    local rv = math.floor(r.PCM_Source_GetPeaks(src, peakrate, 0, nch, buckets, 0, buf))
+    return rv & 0xfffff, buf
+  end
+  local returned, buf = read()
+  if returned < buckets then
+    r.PCM_Source_BuildPeaks(src, 0)
+    local iters = 0
+    while r.PCM_Source_BuildPeaks(src, 1) ~= 0 and iters < 200000 do iters = iters + 1 end
+    r.PCM_Source_BuildPeaks(src, 2)
+    returned, buf = read()
+  end
+  r.PCM_Source_Destroy(src)
+  if returned < 1 then return nil end
+  local n = math.min(returned, buckets)
+  local minbase = nch * buckets
+  local peaks = {}
+  for b = 0, n - 1 do
+    local mx, mn = -1.0, 1.0
+    for c = 0, nch - 1 do
+      local vmax = buf[b * nch + c + 1]      -- interleaved by channel within the max block
+      local vmin = buf[minbase + b * nch + c + 1]
+      if vmax > mx then mx = vmax end
+      if vmin < mn then mn = vmin end
+    end
+    peaks[b + 1] = { mn = mn, mx = mx }
+  end
+  return peaks
+end
+
+-- Waveform strip + transport (play/pause/stop/loop, position readout, playhead, click-to-seek)
+-- for the selected preset's preview.
+local function waveform_and_transport()
+  local sel = r.HB_Pot_GetSelectedPresetIndex()
+  -- React to a selection change: a new preset is a fresh transport context, and its peaks
+  -- are (re)scheduled for computation after the debounce.
+  if sel ~= wave.last_sel then
+    wave.last_sel = sel
+    transport.paused = false
+    wave.peaks = nil
+    wave.index = nil
+    wave.pending_index = (sel >= 0) and sel or nil
+    wave.pending_at = r.time_precise()
+  end
+  -- Debounced peak computation.
+  if wave.pending_index ~= nil and (r.time_precise() - wave.pending_at) > WAVE_DEBOUNCE then
+    local idx = wave.pending_index
+    wave.pending_index = nil
+    local ok, path = r.HB_Pot_GetPreviewPath(idx)
+    if ok ~= 0 and path and path ~= '' then
+      wave.peaks = compute_peaks(path, WAVE_BUCKETS)
+      wave.index = idx
+    end
+  end
+
+  -- Transport controls.
+  local playing = r.HB_Pot_IsPreviewPlaying() ~= 0
+  if r.ImGui_Button(ctx, playing and '\u{23F8} Pause' or '\u{25B6} Play') then
+    if playing then
+      r.HB_Pot_PausePreview(); transport.paused = true
+    elseif transport.paused then
+      r.HB_Pot_ResumePreview(); transport.paused = false
+    elseif sel >= 0 then
+      r.HB_Pot_PlayPreview(sel); transport.paused = false
+    end
+  end
+  r.ImGui_SameLine(ctx)
+  if r.ImGui_Button(ctx, '\u{25A0} Stop') then r.HB_Pot_StopPreview(); transport.paused = false end
+  r.ImGui_SameLine(ctx)
+  local looped = r.HB_Pot_GetPreviewLooped() ~= 0
+  local lc, lv = r.ImGui_Checkbox(ctx, 'Loop', looped)
+  if lc then r.HB_Pot_SetPreviewLooped(lv and 1 or 0) end
+  local pos_ms = r.HB_Pot_GetPreviewPosition()
+  local len_ms = r.HB_Pot_GetPreviewLength()
+  if len_ms > 0 and pos_ms >= 0 then
+    r.ImGui_SameLine(ctx)
+    r.ImGui_Text(ctx, string.format('%.1f / %.1f s', pos_ms / 1000, len_ms / 1000))
+  end
+
+  -- Waveform area: an invisible button captures clicks; we draw over it with the draw list.
+  local availw = r.ImGui_GetContentRegionAvail(ctx)
+  if availw < 16 then return end
+  local x, y = r.ImGui_GetCursorScreenPos(ctx)
+  r.ImGui_InvisibleButton(ctx, '##waveform', availw, WAVE_HEIGHT)
+  local clicked = r.ImGui_IsItemClicked(ctx)
+  local dl = r.ImGui_GetWindowDrawList(ctx)
+  local mid = y + WAVE_HEIGHT / 2
+  r.ImGui_DrawList_AddRectFilled(dl, x, y, x + availw, y + WAVE_HEIGHT, 0x1A1A1AFF)
+  if wave.peaks and wave.index == sel then
+    local n = #wave.peaks
+    local half = WAVE_HEIGHT / 2 - 2
+    for i = 1, n do
+      local px = x + (i - 0.5) / n * availw
+      local top = mid - wave.peaks[i].mx * half
+      local bot = mid - wave.peaks[i].mn * half
+      r.ImGui_DrawList_AddLine(dl, px, top, px, bot, 0x6AA0FFFF, 1.0)
+    end
+  else
+    r.ImGui_DrawList_AddLine(dl, x, mid, x + availw, mid, 0x404040FF, 1.0)
+  end
+  -- Playhead.
+  if len_ms > 0 and pos_ms >= 0 then
+    local frac = math.min(pos_ms / len_ms, 1.0)
+    local hx = x + frac * availw
+    r.ImGui_DrawList_AddLine(dl, hx, y, hx, y + WAVE_HEIGHT, 0xFFFFFFC0, 1.0)
+  end
+  -- Click to seek (and start playback from there if stopped).
+  if clicked then
+    local mxp = r.ImGui_GetMousePos(ctx)
+    local frac = math.max(0.0, math.min((mxp - x) / availw, 1.0))
+    if len_ms > 0 then
+      r.HB_Pot_SeekPreview(math.floor(frac * len_ms))
+      if r.HB_Pot_IsPreviewPlaying() == 0 then r.HB_Pot_ResumePreview() end
+      transport.paused = false
+    elseif sel >= 0 then
+      r.HB_Pot_PlayPreview(sel)
+      local l2 = r.HB_Pot_GetPreviewLength()
+      if l2 > 0 then r.HB_Pot_SeekPreview(math.floor(frac * l2)) end
+      transport.paused = false
+    end
+  end
+end
+
 local function frame()
   toolbar()
   destination_panel()
@@ -1122,6 +1276,11 @@ local function frame()
   r.ImGui_NewLine(ctx)
   r.ImGui_Separator(ctx)
   selected_preset_info()
+  -- Waveform + transport (only when the standalone extension exposes the transport API).
+  if r.HB_Pot_GetPreviewPosition then
+    r.ImGui_Separator(ctx)
+    waveform_and_transport()
+  end
   r.ImGui_Separator(ctx)
   preset_table()
 end

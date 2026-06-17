@@ -671,6 +671,38 @@ impl RuntimePotUnit {
         self.sound_player.stop()
     }
 
+    pub fn pause_preview(&self) -> anyhow::Result<()> {
+        self.sound_player.pause()
+    }
+
+    pub fn resume_preview(&self) -> anyhow::Result<()> {
+        self.sound_player.resume()
+    }
+
+    pub fn is_preview_playing(&self) -> bool {
+        self.sound_player.is_playing()
+    }
+
+    pub fn seek_preview(&self, pos_secs: f64) -> anyhow::Result<()> {
+        self.sound_player.seek(pos_secs)
+    }
+
+    pub fn preview_position(&self) -> f64 {
+        self.sound_player.position().unwrap_or(0.0)
+    }
+
+    pub fn preview_length(&self) -> f64 {
+        self.sound_player.length()
+    }
+
+    pub fn is_preview_looped(&self) -> bool {
+        self.sound_player.is_looped().unwrap_or(false)
+    }
+
+    pub fn set_preview_looped(&self, looped: bool) -> anyhow::Result<()> {
+        self.sound_player.set_looped(looped)
+    }
+
     pub fn preset_and_id(&self) -> Option<(PresetId, PotPreset)> {
         let preset_id = self.preset_id()?;
         let preset = pot_db().find_preset_by_id(preset_id)?;
