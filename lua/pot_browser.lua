@@ -521,37 +521,46 @@ local function preset_table()
     -- auto-preview the new selection, exactly like clicking a row. Gated on no item being
     -- active so typing in the search field (or a filter popup) isn't hijacked.
     if not r.ImGui_IsAnyItemActive(ctx) and count > 0 then
-      local dir = 0
-      if r.ImGui_IsKeyPressed(ctx, r.ImGui_Key_DownArrow(), true) then
-        dir = 1
-      elseif r.ImGui_IsKeyPressed(ctx, r.ImGui_Key_UpArrow(), true) then
-        dir = -1
-      end
-      if dir ~= 0 then
-        -- Find the display row currently holding the selected engine index.
-        local cur_disp = nil
-        if selected >= 0 then
-          if perm then
-            for d = 1, count do
-              if perm[d] == selected then cur_disp = d - 1 break end
-            end
-          else
-            cur_disp = selected
+      -- Find the display row currently holding the selected engine index.
+      local cur_disp = nil
+      if selected >= 0 then
+        if perm then
+          for d = 1, count do
+            if perm[d] == selected then cur_disp = d - 1 break end
           end
-        end
-        local new_disp
-        if cur_disp == nil then
-          new_disp = (dir == 1) and 0 or (count - 1)
         else
-          new_disp = math.max(0, math.min(cur_disp + dir, count - 1))
+          cur_disp = selected
         end
+      end
+      -- A page jumps by one screenful, measured from the previous frame's clipper range
+      -- (minus one row of overlap), falling back to a sane default before that's known.
+      local page = math.max(1, (preset_nav.visible_rows or 12) - 1)
+      -- Compute the target display row from whichever navigation key was pressed. Arrows and
+      -- Page keys auto-repeat when held; Home/End don't.
+      local target = nil
+      if r.ImGui_IsKeyPressed(ctx, r.ImGui_Key_DownArrow(), true) then
+        target = (cur_disp or -1) + 1
+      elseif r.ImGui_IsKeyPressed(ctx, r.ImGui_Key_UpArrow(), true) then
+        target = (cur_disp or count) - 1
+      elseif r.ImGui_IsKeyPressed(ctx, r.ImGui_Key_PageDown(), true) then
+        target = (cur_disp or -1) + page
+      elseif r.ImGui_IsKeyPressed(ctx, r.ImGui_Key_PageUp(), true) then
+        target = (cur_disp or count) - page
+      elseif r.ImGui_IsKeyPressed(ctx, r.ImGui_Key_Home(), false) then
+        target = 0
+      elseif r.ImGui_IsKeyPressed(ctx, r.ImGui_Key_End(), false) then
+        target = count - 1
+      end
+      if target ~= nil then
+        local new_disp = math.max(0, math.min(target, count - 1))
         local new_i = perm and perm[new_disp + 1] or new_disp
         if new_i ~= selected then
           r.HB_Pot_SetSelectedPresetIndex(new_i)
           if auto_preview then r.HB_Pot_PlayPreview(new_i) end
           selected = new_i
-          preset_nav.scroll_to_disp = new_disp
         end
+        -- Keep the target row visible even at the list's edges.
+        preset_nav.scroll_to_disp = new_disp
       end
     end
     r.ImGui_ListClipper_Begin(clipper, count)
@@ -564,8 +573,12 @@ local function preset_table()
     if preset_nav.scroll_to_disp and include_item then
       include_item(clipper, preset_nav.scroll_to_disp)
     end
+    -- Track the largest clipped range this frame as the visible row count (a forced
+    -- off-screen include shows up as its own tiny range, so take the max, not any one step).
+    local visible_rows_seen = 0
     while r.ImGui_ListClipper_Step(clipper) do
       local first, last = r.ImGui_ListClipper_GetDisplayRange(clipper)
+      visible_rows_seen = math.max(visible_rows_seen, last - first)
       for row = first, last - 1 do
         -- Map the display row to the engine preset index via the sort permutation.
         local i = perm and perm[row + 1] or row
@@ -610,6 +623,7 @@ local function preset_table()
         r.ImGui_Text(ctx, r.HB_Pot_HasPreview(i) ~= 0 and '\u{266A}' or '')
       end
     end
+    if visible_rows_seen > 0 then preset_nav.visible_rows = visible_rows_seen end
     r.ImGui_EndTable(ctx)
   end
 end
