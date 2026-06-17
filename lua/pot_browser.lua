@@ -228,13 +228,15 @@ local function filter_combo(kind, state)
     local abort_to_search = r.ImGui_IsKeyDown(ctx, r.ImGui_Mod_Ctrl())
         and r.ImGui_IsKeyPressed(ctx, r.ImGui_Key_F(), false)
     if abort_to_search then r.ImGui_CloseCurrentPopup(ctx) end
-    if not abort_to_search and (state.focus_input or not state.input_active) then
+    -- Focus the search field only when the popup first opens, NOT every frame the input is
+    -- inactive: forcing keyboard focus each frame steals the activation from a list entry the
+    -- user clicks, so clicking an entry would never register (only type + Enter worked).
+    if not abort_to_search and state.focus_input then
       r.ImGui_SetKeyboardFocusHere(ctx)
       state.focus_input = false
     end
     r.ImGui_SetNextItemWidth(ctx, POPUP_WIDTH - 16)
     local changed, new_text = r.ImGui_InputText(ctx, '##search_' .. kind.id, state.search)
-    state.input_active = r.ImGui_IsItemActive(ctx)
     if changed then
       state.search = new_text
       state.matches = get_filter_matches(kind.id, state.search)
