@@ -485,6 +485,9 @@ local function preset_sort_perm(count)
   return perm
 end
 
+-- Display row (0-based, in the sorted order) to scroll into view after keyboard navigation.
+local preset_nav = { scroll_to_disp = nil }
+
 local function preset_table()
   local count = r.HB_Pot_GetPresetCount()
   if count < 0 then
@@ -514,7 +517,53 @@ local function preset_table()
       sort_state.desc = dir == r.ImGui_SortDirection_Descending()
     end
     local perm = preset_sort_perm(count)
+    -- Keyboard navigation: Up/Down move the selection through the displayed (sorted) order and
+    -- auto-preview the new selection, exactly like clicking a row. Gated on no item being
+    -- active so typing in the search field (or a filter popup) isn't hijacked.
+    if not r.ImGui_IsAnyItemActive(ctx) and count > 0 then
+      local dir = 0
+      if r.ImGui_IsKeyPressed(ctx, r.ImGui_Key_DownArrow(), true) then
+        dir = 1
+      elseif r.ImGui_IsKeyPressed(ctx, r.ImGui_Key_UpArrow(), true) then
+        dir = -1
+      end
+      if dir ~= 0 then
+        -- Find the display row currently holding the selected engine index.
+        local cur_disp = nil
+        if selected >= 0 then
+          if perm then
+            for d = 1, count do
+              if perm[d] == selected then cur_disp = d - 1 break end
+            end
+          else
+            cur_disp = selected
+          end
+        end
+        local new_disp
+        if cur_disp == nil then
+          new_disp = (dir == 1) and 0 or (count - 1)
+        else
+          new_disp = math.max(0, math.min(cur_disp + dir, count - 1))
+        end
+        local new_i = perm and perm[new_disp + 1] or new_disp
+        if new_i ~= selected then
+          r.HB_Pot_SetSelectedPresetIndex(new_i)
+          if auto_preview then r.HB_Pot_PlayPreview(new_i) end
+          selected = new_i
+          preset_nav.scroll_to_disp = new_disp
+        end
+      end
+    end
     r.ImGui_ListClipper_Begin(clipper, count)
+    -- Force the clipper to render the row we want to scroll to, even if it's currently
+    -- off-screen, so SetScrollHereY below can bring it into view. This is a ReaImGui 0.10+
+    -- function absent from the checker's older defs, hence the suppression; the nil guard
+    -- keeps it safe on older builds (scrolling to off-screen rows just won't occur there).
+    ---@diagnostic disable-next-line: undefined-field
+    local include_item = r.ImGui_ListClipper_IncludeItemByIndex
+    if preset_nav.scroll_to_disp and include_item then
+      include_item(clipper, preset_nav.scroll_to_disp)
+    end
     while r.ImGui_ListClipper_Step(clipper) do
       local first, last = r.ImGui_ListClipper_GetDisplayRange(clipper)
       for row = first, last - 1 do
@@ -528,6 +577,11 @@ local function preset_table()
               r.ImGui_SelectableFlags_SpanAllColumns()) then
           r.HB_Pot_SetSelectedPresetIndex(i)
           if auto_preview then r.HB_Pot_PlayPreview(i) end
+        end
+        -- Keep the keyboard-selected row visible.
+        if preset_nav.scroll_to_disp == row then
+          r.ImGui_SetScrollHereY(ctx, 0.5)
+          preset_nav.scroll_to_disp = nil
         end
         if r.ImGui_IsItemHovered(ctx) and r.ImGui_IsMouseDoubleClicked(ctx, 0) then
           r.HB_Pot_LoadPreset(i)
