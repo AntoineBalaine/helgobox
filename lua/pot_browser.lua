@@ -71,6 +71,31 @@ local wave = {
 -- (play starts the selected preset from the beginning).
 local transport = { paused = false }
 
+-- Persisted global UI preferences, stored in pot's database via HB_Pot_Get/SetConfig (so they
+-- survive restarts and apply everywhere; the standalone browser has no per-project scope).
+-- Guarded so older extensions without the config API simply don't persist.
+local prefs_loaded = false
+local function get_cfg(key)
+  if not r.HB_Pot_GetConfig then return nil end
+  local ok, val = r.HB_Pot_GetConfig(key)
+  if ok ~= 0 then return val end
+  return nil
+end
+local function set_cfg(key, value)
+  if r.HB_Pot_SetConfig then r.HB_Pot_SetConfig(key, value) end
+end
+local function load_prefs()
+  local v = get_cfg('auto_preview'); if v then auto_preview = (v == '1') end
+  v = get_cfg('wildcards'); if v then r.HB_Pot_SetUseWildcards(v == '1' and 1 or 0) end
+  for field = 0, 2 do
+    v = get_cfg('search_field_' .. field)
+    if v then r.HB_Pot_SetSearchField(field, v == '1' and 1 or 0) end
+  end
+  v = get_cfg('name_track'); if v then r.HB_Pot_SetNameTrackAfterPreset(v == '1' and 1 or 0) end
+  v = get_cfg('load_window_behavior')
+  if v then local n = tonumber(v); if n then r.HB_Pot_SetLoadWindowBehavior(n) end end
+end
+
 -- Preset table sorting. The engine always orders presets name-ascending, so Name/asc is the
 -- identity order and Name/desc is just the reversed index list (no data reads). FX (product)
 -- sorting reads each preset's product and is cached on a cheap signature so it only rebuilds
@@ -635,11 +660,17 @@ local function options_popup()
       local field = idx - 1
       local on = r.HB_Pot_GetSearchField(field) ~= 0
       local changed, new_on = r.ImGui_Checkbox(ctx, label, on)
-      if changed then r.HB_Pot_SetSearchField(field, new_on and 1 or 0) end
+      if changed then
+        r.HB_Pot_SetSearchField(field, new_on and 1 or 0)
+        set_cfg('search_field_' .. field, new_on and '1' or '0')
+      end
     end
     local wc = r.HB_Pot_GetUseWildcards() ~= 0
     local wc_changed, new_wc = r.ImGui_Checkbox(ctx, 'Wildcards (* and ?)', wc)
-    if wc_changed then r.HB_Pot_SetUseWildcards(new_wc and 1 or 0) end
+    if wc_changed then
+      r.HB_Pot_SetUseWildcards(new_wc and 1 or 0)
+      set_cfg('wildcards', new_wc and '1' or '0')
+    end
     r.ImGui_Separator(ctx)
     r.ImGui_Text(ctx, 'Load options')
     -- FX window behavior
@@ -651,13 +682,17 @@ local function options_popup()
         local _, n = r.HB_Pot_GetLoadWindowBehaviorName(i)
         if r.ImGui_Selectable(ctx, (n or tostring(i)) .. '##wb' .. i, i == wb) then
           r.HB_Pot_SetLoadWindowBehavior(i)
+          set_cfg('load_window_behavior', tostring(i))
         end
       end
       r.ImGui_EndCombo(ctx)
     end
     local nt = r.HB_Pot_GetNameTrackAfterPreset() ~= 0
     local nt_changed, new_nt = r.ImGui_Checkbox(ctx, 'Name track after preset', nt)
-    if nt_changed then r.HB_Pot_SetNameTrackAfterPreset(new_nt and 1 or 0) end
+    if nt_changed then
+      r.HB_Pot_SetNameTrackAfterPreset(new_nt and 1 or 0)
+      set_cfg('name_track', new_nt and '1' or '0')
+    end
     r.ImGui_EndPopup(ctx)
   end
 end
@@ -803,7 +838,10 @@ local function toolbar()
   end
   r.ImGui_SameLine(ctx)
   local apc, ap = r.ImGui_Checkbox(ctx, 'Auto-preview', auto_preview)
-  if apc then auto_preview = ap end
+  if apc then
+    auto_preview = ap
+    set_cfg('auto_preview', ap and '1' or '0')
+  end
   -- Preset Crawler (only when the standalone extension exposes the crawler API).
   if r.HB_Pot_CrawlerStart then
     r.ImGui_SameLine(ctx)
@@ -1359,6 +1397,11 @@ local function loop()
       r.HB_Pot_Refresh()
     end
     refreshed_once = true
+  end
+  -- Restore persisted UI preferences once the engine is available.
+  if not prefs_loaded and r.HB_Pot_IsAvailable() ~= 0 then
+    load_prefs()
+    prefs_loaded = true
   end
   r.ImGui_SetNextWindowSize(ctx, 820, 560, r.ImGui_Cond_FirstUseEver())
   local visible, open = r.ImGui_Begin(ctx, 'Pot Browser (Lua)', true)

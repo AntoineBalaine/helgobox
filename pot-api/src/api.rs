@@ -1775,6 +1775,56 @@ unsafe extern "C" fn vararg_HB_Pot_DbRebuildIndex(_: *mut *mut c_void, _: c_int)
     ret_int(HB_Pot_DbRebuildIndex())
 }
 
+// ---------------------------------------------------------------------------
+// Generic UI config (small persisted key/value strings for the browser's prefs)
+// ---------------------------------------------------------------------------
+
+/// Internal `meta` key prefix so UI config can't collide with engine keys (preview_volume,
+/// plugin_set, adoption_done, ...).
+fn config_meta_key(key: &str) -> String {
+    format!("cfg.{key}")
+}
+
+extern "C" fn HB_Pot_GetConfig(key: *const c_char, buf: *mut c_char, buf_sz: c_int) -> c_int {
+    if key.is_null() {
+        return 0;
+    }
+    let key = unsafe { CStr::from_ptr(key) }.to_string_lossy();
+    match pot::db::get_meta(&config_meta_key(&key)) {
+        Some(value) => unsafe { copy_to_buf(&value, buf, buf_sz) as c_int },
+        None => 0,
+    }
+}
+unsafe extern "C" fn vararg_HB_Pot_GetConfig(args: *mut *mut c_void, n: c_int) -> *mut c_void {
+    let key = str_arg(args, n, 0)
+        .map(|s| s.as_ptr())
+        .unwrap_or(std::ptr::null());
+    ret_int(HB_Pot_GetConfig(key, buf_arg(args, n, 1), int_arg(args, n, 2)))
+}
+
+extern "C" fn HB_Pot_SetConfig(key: *const c_char, value: *const c_char) {
+    if key.is_null() {
+        return;
+    }
+    let key = unsafe { CStr::from_ptr(key) }.to_string_lossy();
+    let value = if value.is_null() {
+        String::new()
+    } else {
+        unsafe { CStr::from_ptr(value) }.to_string_lossy().into_owned()
+    };
+    pot::db::set_meta(&config_meta_key(&key), &value);
+}
+unsafe extern "C" fn vararg_HB_Pot_SetConfig(args: *mut *mut c_void, n: c_int) -> *mut c_void {
+    let key = str_arg(args, n, 0)
+        .map(|s| s.as_ptr())
+        .unwrap_or(std::ptr::null());
+    let value = str_arg(args, n, 1)
+        .map(|s| s.as_ptr())
+        .unwrap_or(std::ptr::null());
+    HB_Pot_SetConfig(key, value);
+    std::ptr::null_mut()
+}
+
 // ============================================================================
 // Registration
 // ============================================================================
@@ -1913,6 +1963,8 @@ macro_rules! paste_vararg {
     (HB_Pot_SetPreviewLooped) => { vararg_HB_Pot_SetPreviewLooped };
     (HB_Pot_GetPreviewMuted) => { vararg_HB_Pot_GetPreviewMuted };
     (HB_Pot_SetPreviewMuted) => { vararg_HB_Pot_SetPreviewMuted };
+    (HB_Pot_GetConfig) => { vararg_HB_Pot_GetConfig };
+    (HB_Pot_SetConfig) => { vararg_HB_Pot_SetConfig };
 }
 
 fn pot_api_fns() -> Vec<PotApiFn> {
@@ -1951,6 +2003,10 @@ fn pot_api_fns() -> Vec<PotApiFn> {
             b"int\0\0\0Returns 1 if preview playback is muted. Mute is separate from the volume, so muting never changes (or persists) the volume setting.\0";
         HB_Pot_SetPreviewMuted:
             b"void\0int\0on\0Mutes (on=1) or unmutes (on=0) preview playback without changing the stored volume.\0";
+        HB_Pot_GetConfig:
+            b"int\0const char*,char*,int\0key,valueOut,valueOut_sz\0Reads a persisted UI config string (in pot's database, namespaced from engine keys). Returns 0 if the key was never set.\0";
+        HB_Pot_SetConfig:
+            b"void\0const char*,const char*\0key,value\0Persists a UI config string in pot's database (survives restarts). Used by the browser to remember preferences like auto-preview, search fields, wildcards, and load options.\0";
         HB_Pot_LoadPreset:
             b"int\0int\0index\0Loads the preset at the given index into the configured destination. Returns 0 on failure.\0";
         HB_Pot_GetFilterItemCount:
