@@ -390,6 +390,21 @@ unsafe extern "C" fn vararg_HB_Pot_SetPreviewVolume(
     std::ptr::null_mut()
 }
 
+extern "C" fn HB_Pot_GetPreviewMuted() -> c_int {
+    with_pot_unit(|_, unit| unit.is_preview_muted() as c_int).unwrap_or(0)
+}
+unsafe extern "C" fn vararg_HB_Pot_GetPreviewMuted(_: *mut *mut c_void, _: c_int) -> *mut c_void {
+    ret_int(HB_Pot_GetPreviewMuted())
+}
+
+extern "C" fn HB_Pot_SetPreviewMuted(on: c_int) {
+    with_pot_unit(|_, unit| unit.set_preview_muted(on != 0));
+}
+unsafe extern "C" fn vararg_HB_Pot_SetPreviewMuted(args: *mut *mut c_void, n: c_int) -> *mut c_void {
+    HB_Pot_SetPreviewMuted(int_arg(args, n, 0));
+    std::ptr::null_mut()
+}
+
 extern "C" fn HB_Pot_DarkModeEnabled() -> c_int {
     reaper_low::firewall(|| swell_ui::Window::dark_mode_is_enabled() as c_int).unwrap_or(0)
 }
@@ -1896,6 +1911,8 @@ macro_rules! paste_vararg {
     (HB_Pot_SeekPreview) => { vararg_HB_Pot_SeekPreview };
     (HB_Pot_GetPreviewLooped) => { vararg_HB_Pot_GetPreviewLooped };
     (HB_Pot_SetPreviewLooped) => { vararg_HB_Pot_SetPreviewLooped };
+    (HB_Pot_GetPreviewMuted) => { vararg_HB_Pot_GetPreviewMuted };
+    (HB_Pot_SetPreviewMuted) => { vararg_HB_Pot_SetPreviewMuted };
 }
 
 fn pot_api_fns() -> Vec<PotApiFn> {
@@ -1929,7 +1946,11 @@ fn pot_api_fns() -> Vec<PotApiFn> {
         HB_Pot_GetPreviewVolume:
             b"int\0\0\0Returns the preview playback volume as permille of raw gain (0-1000), or -1 if no Pot unit is available.\0";
         HB_Pot_SetPreviewVolume:
-            b"void\0int\0volume_permille\0Sets the preview playback volume as permille of raw gain (0-1000).\0";
+            b"void\0int\0volume_permille\0Sets the preview playback volume as permille of raw gain (0-1000). Persisted across restarts.\0";
+        HB_Pot_GetPreviewMuted:
+            b"int\0\0\0Returns 1 if preview playback is muted. Mute is separate from the volume, so muting never changes (or persists) the volume setting.\0";
+        HB_Pot_SetPreviewMuted:
+            b"void\0int\0on\0Mutes (on=1) or unmutes (on=0) preview playback without changing the stored volume.\0";
         HB_Pot_LoadPreset:
             b"int\0int\0index\0Loads the preset at the given index into the configured destination. Returns 0 on failure.\0";
         HB_Pot_GetFilterItemCount:

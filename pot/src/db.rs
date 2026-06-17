@@ -97,6 +97,16 @@ pub fn cache_sweep(provider: &str, pass: i64) {
     with_conn(|c| pot_db::cache_sweep(c, provider, pass));
 }
 
+/// Read a small persisted setting from the `meta` key/value table (best-effort).
+pub fn get_meta(key: &str) -> Option<String> {
+    with_conn(|c| pot_db::meta_get(c, key)).flatten()
+}
+
+/// Persist a small setting into the `meta` key/value table (best-effort).
+pub fn set_meta(key: &str, value: &str) {
+    with_conn(|c| pot_db::meta_set(c, key, value));
+}
+
 /// If `token` differs from the last-stored value for `key`, drop the entire scan cache and
 /// record the new token. Used to invalidate the cache when the installed plugin set changes
 /// (cached entries store resolved plugins, which depend on the live plugin DB). Best-effort;

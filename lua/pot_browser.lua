@@ -51,7 +51,6 @@ local search_text = nil -- lazily initialized from the engine
 local refreshed_once = false
 local focus_search_on_next_frame = false
 local auto_preview = true
-local volume_before_mute = nil -- non-nil while muted
 
 -- Waveform preview. Peaks for the selected preset's preview are computed via REAPER's
 -- GetPeaks (debounced after the selection settles, so hammering "next" never triggers work)
@@ -793,18 +792,13 @@ local function toolbar()
     local vchanged, new_vol = r.ImGui_SliderInt(ctx, '##vol', vol, 0, 1000, db_label(vol))
     if vchanged then
       r.HB_Pot_SetPreviewVolume(new_vol)
-      volume_before_mute = nil
     end
     r.ImGui_SameLine(ctx)
-    local muted = volume_before_mute ~= nil
+    -- Mute is an engine-side flag separate from the (persisted) volume, so toggling it never
+    -- disturbs the stored volume.
+    local muted = r.HB_Pot_GetPreviewMuted() ~= 0
     if r.ImGui_Button(ctx, muted and 'Unmute' or 'Mute') then
-      if muted then
-        r.HB_Pot_SetPreviewVolume(volume_before_mute)
-        volume_before_mute = nil
-      else
-        volume_before_mute = vol
-        r.HB_Pot_SetPreviewVolume(0)
-      end
+      r.HB_Pot_SetPreviewMuted(muted and 0 or 1)
     end
   end
   r.ImGui_SameLine(ctx)

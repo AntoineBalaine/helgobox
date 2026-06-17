@@ -164,7 +164,11 @@ pub struct RuntimePotUnit {
     pub stats: Stats,
     build_counter: u64,
     sound_player: SoundPlayer,
+    /// The user's intended preview volume (persisted). Mute is tracked separately
+    /// (`preview_muted`) rather than by zeroing this, so the persisted value is never the
+    /// muted 0.
     preview_volume: ReaperVolumeValue,
+    preview_muted: bool,
     pub default_load_preset_window_behavior: LoadPresetWindowBehavior,
     pub destination_descriptor: DestinationDescriptor,
     pub name_track_after_preset: bool,
@@ -570,6 +574,15 @@ impl RuntimePotUnit {
         integration: BoxedPotIntegration,
     ) -> Result<SharedRuntimePotUnit, &'static str> {
         let sound_player = SoundPlayer::new();
+        // Restore the persisted preview volume (best-effort; defaults to the sound player's
+        // default if absent or unparseable). Stored as raw gain; clamped to the slider's
+        // 0..=unity range for safety against a corrupted value.
+        let preview_volume = crate::db::get_meta("preview_volume")
+            .and_then(|s| s.parse::<f64>().ok())
+            .filter(|v| v.is_finite())
+            .map(|v| ReaperVolumeValue::new_panic(v.clamp(0.0, 1.0)))
+            .unwrap_or_else(|| sound_player.volume().unwrap_or_default());
+        sound_player.set_volume(preview_volume).ok();
         let unit = Self {
             runtime_state: RuntimeState::load(state)?,
             filter_item_collections: Default::default(),
@@ -579,7 +592,8 @@ impl RuntimePotUnit {
             wasted_duration: Default::default(),
             stats: Default::default(),
             build_counter: 0,
-            preview_volume: sound_player.volume().unwrap_or_default(),
+            preview_volume,
+            preview_muted: false,
             sound_player,
             destination_descriptor: Default::default(),
             name_track_after_preset: true,
@@ -607,9 +621,30 @@ impl RuntimePotUnit {
 
     pub fn set_preview_volume(&mut self, volume: ReaperVolumeValue) {
         self.preview_volume = volume;
-        self.sound_player
-            .set_volume(volume)
-            .expect("changing preview volume value failed");
+        // Apply unless muted (mute keeps the applied volume at 0 while the intended volume
+        // updates underneath); persist the intended volume so it survives restarts.
+        if !self.preview_muted {
+            self.sound_player
+                .set_volume(volume)
+                .expect("changing preview volume value failed");
+        }
+        crate::db::set_meta("preview_volume", &volume.get().to_string());
+    }
+
+    pub fn is_preview_muted(&self) -> bool {
+        self.preview_muted
+    }
+
+    pub fn set_preview_muted(&mut self, muted: bool) {
+        self.preview_muted = muted;
+        // Mute applies silence without disturbing (or persisting) the intended volume, so it
+        // is restored intact on unmute and across restarts.
+        let applied = if muted {
+            ReaperVolumeValue::new_panic(0.0)
+        } else {
+            self.preview_volume
+        };
+        self.sound_player.set_volume(applied).ok();
     }
 
     pub fn persistent_state(&self) -> PersistentState {
