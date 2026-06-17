@@ -7,6 +7,7 @@
 
 mod api;
 mod crawler;
+mod db_maintenance;
 mod executor;
 mod recorder;
 mod standalone_unit;

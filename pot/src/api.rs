@@ -618,6 +618,10 @@ impl PersistentPresetId {
             inner_preset_id,
         }
     }
+
+    pub fn db_id(&self) -> &PersistentDatabaseId {
+        &self.db_id
+    }
 }
 
 impl Display for PersistentPresetId {

@@ -82,6 +82,36 @@ struct PresetEntry {
     content_hash: PersistentHash,
 }
 
+/// Stable on-disk mirror of [`PresetEntry`] for the scan cache (one per file). Plugins are a
+/// sequence (not a map, since `PluginId` can't be a JSON key) and the hash is hex.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct CachedDirEntry {
+    preset_name: String,
+    relative_path: String,
+    plugins: Vec<crate::db::CachedPluginCore>,
+    content_hash: String,
+}
+
+impl CachedDirEntry {
+    fn from_entry(e: &PresetEntry) -> Self {
+        Self {
+            preset_name: e.preset_name.clone(),
+            relative_path: e.relative_path.clone(),
+            plugins: crate::db::cores_to_cached(&e.plugin_cores),
+            content_hash: crate::db::hash_to_hex(e.content_hash),
+        }
+    }
+
+    fn into_entry(self) -> Option<PresetEntry> {
+        Some(PresetEntry {
+            preset_name: self.preset_name,
+            relative_path: self.relative_path,
+            plugin_cores: crate::db::cores_from_cached(&self.plugins)?,
+            content_hash: crate::db::hash_from_hex(&self.content_hash)?,
+        })
+    }
+}
+
 impl Database for DirectoryDatabase {
     fn persistent_id(&self) -> &PersistentDatabaseId {
         &self.persistent_id
@@ -100,6 +130,11 @@ impl Database for DirectoryDatabase {
     }
 
     fn refresh(&mut self, ctx: &ProviderContext) -> Result<(), Box<dyn Error>> {
+        // Scan cache: each file is one preset here. On an unchanged (mtime, size) we rebuild
+        // the entry from the cached blob and never open the file. The cache is best-effort —
+        // any miss falls back to the original parse path. See `POT_DB_DESIGN.md`.
+        let pass = crate::db::pass_ts();
+        let provider_key = self.root_dir.as_str();
         self.entries = WalkDir::new(&self.root_dir)
             .follow_links(true)
             .into_iter()
@@ -112,19 +147,43 @@ impl Database for DirectoryDatabase {
                 if !self.valid_extensions.contains(extension) {
                     return None;
                 }
-                let relative_path = entry.path().strip_prefix(&self.root_dir).ok()?;
+                let path = entry.path();
+                let abs_path = path.to_str();
+                let stat = abs_path.and_then(|_| crate::db::file_stat(path));
+                // Try the cache first.
+                if let (Some(abs), Some((mtime, size))) = (abs_path, stat) {
+                    if let Some(blob) = crate::db::cache_lookup(abs, mtime, size, pass) {
+                        if let Some(entry) = serde_json::from_str::<CachedDirEntry>(&blob)
+                            .ok()
+                            .and_then(CachedDirEntry::into_entry)
+                        {
+                            return Some(entry);
+                        }
+                    }
+                }
+                // Cache miss: parse the file.
+                let relative_path = path.strip_prefix(&self.root_dir).ok()?;
                 // Immediately exclude relative paths that can't be represented as valid UTF-8.
                 // Otherwise we will potentially open a can of worms (regarding persistence etc.).
-                let processing_output = process_file(entry.path(), ctx.plugin_db).ok()?;
+                let processing_output = process_file(path, ctx.plugin_db).ok()?;
                 let preset_entry = PresetEntry {
-                    preset_name: entry.path().file_stem()?.to_str()?.to_string(),
+                    preset_name: path.file_stem()?.to_str()?.to_string(),
                     relative_path: relative_path.to_str()?.to_string(),
                     plugin_cores: processing_output.used_plugins,
                     content_hash: processing_output.content_hash,
                 };
+                // Populate the cache for next time.
+                if let (Some(abs), Some((mtime, size))) = (abs_path, stat) {
+                    if let Ok(blob) = serde_json::to_string(&CachedDirEntry::from_entry(&preset_entry))
+                    {
+                        crate::db::cache_store(abs, mtime, size, provider_key, &blob, pass);
+                    }
+                }
                 Some(preset_entry)
             })
             .collect();
+        // Drop cache rows for files that vanished from this directory.
+        crate::db::cache_sweep(provider_key, pass);
         Ok(())
     }
 

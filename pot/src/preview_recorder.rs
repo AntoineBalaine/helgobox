@@ -138,9 +138,88 @@ pub async fn record_previews(args: RecordPreviewsArgs<'_>) -> Result<(), Box<dyn
         // Record preview
         if let Err(e) = render_to_file(project, &preview_file_path) {
             report_failure(preset_with_id, e.to_string());
+        } else if matches!(&args.config, PreviewOutputConfig::ForPotBrowserPlayback) {
+            // Register the recorded preview so the has-preview filter is a DB lookup (not an
+            // fs probe) and orphan GC can enumerate it, and embed the same identity as Vorbis
+            // comments so the file is self-describing. Only pot-owned previews (browser
+            // playback, named by hash) go in the registry; exported previews do not.
+            register_recorded_preview(preset, &preview_file_path);
         }
     }
     Ok(())
+}
+
+/// Records a pot-owned preview: writes Vorbis comments into the OGG and inserts a registry
+/// row (see `POT_DB_DESIGN.md`). Best-effort throughout — neither the tagging nor the DB
+/// layer can fail the recording itself.
+fn register_recorded_preview(preset: &crate::PotPreset, preview_file_path: &Utf8Path) {
+    let hash = preset.common.content_or_id_hash();
+    let preview_hash = format!("{:032x}", hash.get());
+    let recorded_at = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    write_preview_vorbis_comments(preview_file_path, preset, &preview_hash);
+    let row = crate::db::PreviewRow {
+        preview_hash,
+        file_path: file_util::convert_hash_to_dir_structure(hash, ".ogg"),
+        preset_name: preset.common.name.clone(),
+        product: preset.common.product_name.clone().unwrap_or_default(),
+        vendor: preset.common.metadata.vendor.clone().unwrap_or_default(),
+        database_id: preset.common.persistent_id.db_id().get().to_string(),
+        persistent_id: preset.common.persistent_id.to_string(),
+        recorded_at,
+    };
+    crate::db::insert_preview(&row);
+}
+
+/// Embeds the preset identity into the preview OGG as Vorbis comments, so a stray file is
+/// self-describing and the registry can be rebuilt from disk. Best-effort: a tagging failure
+/// is logged and ignored (the registry still holds the same data).
+fn write_preview_vorbis_comments(
+    preview_file_path: &Utf8Path,
+    preset: &crate::PotPreset,
+    preview_hash: &str,
+) {
+    use lofty::config::WriteOptions;
+    use lofty::ogg::VorbisComments;
+    use lofty::tag::TagExt;
+
+    fn put(tag: &mut VorbisComments, key: &str, value: &str) {
+        if !value.is_empty() {
+            tag.push(key.to_string(), value.to_string());
+        }
+    }
+
+    let mut tag = VorbisComments::new();
+    put(&mut tag, "PRESET_NAME", &preset.common.name);
+    put(
+        &mut tag,
+        "PRESET_PRODUCT",
+        preset.common.product_name.as_deref().unwrap_or(""),
+    );
+    put(
+        &mut tag,
+        "PRESET_VENDOR",
+        preset.common.metadata.vendor.as_deref().unwrap_or(""),
+    );
+    put(
+        &mut tag,
+        "PRESET_DATABASE",
+        preset.common.persistent_id.db_id().get(),
+    );
+    put(
+        &mut tag,
+        "PRESET_PERSISTENT_ID",
+        &preset.common.persistent_id.to_string(),
+    );
+    put(&mut tag, "PRESET_CONTENT_HASH", preview_hash);
+    put(&mut tag, "REAPER_POT_VERSION", "1");
+    put(&mut tag, "RECORDED_AT", &chrono::Utc::now().to_rfc3339());
+
+    if let Err(e) = tag.save_to_path(preview_file_path.as_std_path(), WriteOptions::default()) {
+        tracing::warn!("failed to write preview Vorbis comments to {preview_file_path}: {e}");
+    }
 }
 
 fn render_to_file(project: Project, full_path: &Utf8Path) -> Result<(), Box<dyn Error>> {

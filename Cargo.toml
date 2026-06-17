@@ -9,6 +9,7 @@ members = [
     "playtime-clip-engine-placeholder",
     "playtime-api",
     "pot",
+    "pot-db",
     "pot-api",
     "pot-extension",
     "pot-browser",
@@ -26,6 +27,7 @@ members = [
 # Own
 base = { path = "base" }
 pot = { path = "pot" }
+pot-db = { path = "pot-db" }
 pot-api = { path = "pot-api" }
 pot-browser = { path = "pot-browser" }
 helgobox-dialogs = { path = "dialogs" }
@@ -53,6 +55,7 @@ helgoboss-license-api = { git = "https://github.com/helgoboss/helgoboss-license-
 scopeguard = "1.1.0"
 rxrust = { git = "https://github.com/rxRust/rxRust", rev = "349e50b3197e05926e2378ef8fc45cb67ad43b83" }
 indexmap = "2.1.0"
+lofty = "0.24"
 itertools = "0.12.0"
 wildmatch = "2.1.0"
 serde = { version = "1.0", features = ["derive", "rc"] }

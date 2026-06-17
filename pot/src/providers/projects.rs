@@ -110,6 +110,13 @@ impl Database for ProjectDatabase {
     }
 
     fn refresh(&mut self, ctx: &ProviderContext) -> Result<(), Box<dyn Error>> {
+        // Scan cache: each `.RPP` caches a `Vec` of its track presets. The `Proj` entry and
+        // its `project_id` are derived from the path (no read) and rebuilt every pass; only
+        // the track-preset extraction (which reads + hashes the file) is cached, with
+        // `project_id` re-assigned on load. Best-effort. See `POT_DB_DESIGN.md`.
+        let pass = crate::db::pass_ts();
+        let provider_key = self.root_dir.to_string_lossy().into_owned();
+        let provider_key = provider_key.as_str();
         self.preset_entries = WalkDir::new(&self.root_dir)
             .follow_links(true)
             .into_iter()
@@ -118,12 +125,13 @@ impl Database for ProjectDatabase {
                 if !entry.file_type().is_file() {
                     return None;
                 }
-                let extension = entry.path().extension()?;
+                let path = entry.path();
+                let extension = path.extension()?;
                 if extension != OsStr::new("RPP") {
                     return None;
                 }
-                let relative_path = entry.path().strip_prefix(&self.root_dir).ok()?;
-                let stem = entry.path().file_stem()?;
+                let relative_path = path.strip_prefix(&self.root_dir).ok()?;
+                let stem = path.file_stem()?;
                 // Immediately exclude relative paths that can't be represented as valid UTF-8.
                 // Otherwise we will potentially open a can of worms (regarding persistence etc.).
                 let project = Proj {
@@ -132,10 +140,38 @@ impl Database for ProjectDatabase {
                 };
                 self.projects.push(project);
                 let project_id = ProjectId(self.projects.len() as u32 - 1);
-                process_file(entry.path(), ctx.plugin_db, project_id).ok()
+                let abs_path = path.to_str();
+                let stat = abs_path.and_then(|_| crate::db::file_stat(path));
+                // Try the cache first.
+                if let (Some(abs), Some((mtime, size))) = (abs_path, stat) {
+                    if let Some(blob) = crate::db::cache_lookup(abs, mtime, size, pass) {
+                        if let Some(entries) = serde_json::from_str::<Vec<CachedProjEntry>>(&blob)
+                            .ok()
+                            .and_then(|v| {
+                                v.into_iter()
+                                    .map(|c| c.into_entry(project_id))
+                                    .collect::<Option<Vec<_>>>()
+                            })
+                        {
+                            return Some(entries);
+                        }
+                    }
+                }
+                // Cache miss: read + extract track presets.
+                let entries = process_file(path, ctx.plugin_db, project_id).ok()?;
+                if let (Some(abs), Some((mtime, size))) = (abs_path, stat) {
+                    let cached: Vec<CachedProjEntry> =
+                        entries.iter().map(CachedProjEntry::from_entry).collect();
+                    if let Ok(blob) = serde_json::to_string(&cached) {
+                        crate::db::cache_store(abs, mtime, size, provider_key, &blob, pass);
+                    }
+                }
+                Some(entries)
             })
             .flatten()
             .collect();
+        // Drop cache rows for `.RPP` files that vanished.
+        crate::db::cache_sweep(provider_key, pass);
         Ok(())
     }
 
@@ -254,6 +290,44 @@ struct TrackPreset {
     fx_chain_range: Range<usize>,
     used_plugins: NonCryptoIndexMap<PluginId, PluginCore>,
     content_hash: PersistentHash,
+}
+
+/// Stable on-disk mirror of a project's [`PresetEntry`] for the scan cache. One `.RPP` caches
+/// a `Vec` of these (many track presets per project). `project_id` is *not* stored — it is a
+/// position index into `self.projects` and is re-assigned on load. See `POT_DB_DESIGN.md`.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct CachedProjEntry {
+    preset_name: String,
+    track_id: String,
+    fx_chain_range: Range<usize>,
+    plugins: Vec<crate::db::CachedPluginCore>,
+    content_hash: String,
+}
+
+impl CachedProjEntry {
+    fn from_entry(e: &PresetEntry) -> Self {
+        let tp = &e.track_preset;
+        Self {
+            preset_name: tp.preset_name.clone(),
+            track_id: tp.track_id.clone(),
+            fx_chain_range: tp.fx_chain_range.clone(),
+            plugins: crate::db::cores_to_cached(&tp.used_plugins),
+            content_hash: crate::db::hash_to_hex(tp.content_hash),
+        }
+    }
+
+    fn into_entry(self, project_id: ProjectId) -> Option<PresetEntry> {
+        Some(PresetEntry {
+            project_id,
+            track_preset: TrackPreset {
+                preset_name: self.preset_name,
+                track_id: self.track_id,
+                fx_chain_range: self.fx_chain_range,
+                used_plugins: crate::db::cores_from_cached(&self.plugins)?,
+                content_hash: crate::db::hash_from_hex(&self.content_hash)?,
+            },
+        })
+    }
 }
 
 fn process_file(

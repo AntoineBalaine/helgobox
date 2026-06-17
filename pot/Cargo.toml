@@ -8,6 +8,7 @@ publish = false
 [dependencies]
 # Own
 base.workspace = true
+pot-db.workspace = true
 reaper-high.workspace = true
 reaper-medium.workspace = true
 helgobox-api.workspace = true
@@ -30,6 +31,7 @@ walkdir.workspace = true
 either.workspace = true
 riff-io.workspace = true
 rusqlite = { workspace = true, features = ["bundled"] }
+lofty.workspace = true
 # For detecting the appearance of plug-in "Save Preset As" dialogs (preset crawler)
 xcap.workspace = true
 # For reading the preset name that the crawler copies out of "Save Preset As" dialogs

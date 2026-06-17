@@ -87,6 +87,12 @@ pub fn create_non_crypto_hash_builder() -> NonCryptoHashBuilder {
 pub struct PersistentHash(u128);
 
 impl PersistentHash {
+    /// Reconstructs a hash from its raw 128-bit value, e.g. when reading it back from the
+    /// on-disk scan cache (where it is stored as a hex string).
+    pub fn from_raw(raw: u128) -> Self {
+        Self(raw)
+    }
+
     pub fn get(&self) -> u128 {
         self.0
     }

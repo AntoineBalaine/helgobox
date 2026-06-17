@@ -70,6 +70,43 @@ struct PresetEntry {
     content_hash: Option<PersistentHash>,
 }
 
+/// Stable on-disk mirror of [`PresetEntry`] for the scan cache. One `.ini` file caches a
+/// `Vec<CachedIniEntry>` (many presets per file). `plugin_kind` is its string form and the
+/// hash is hex. See `POT_DB_DESIGN.md`.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct CachedIniEntry {
+    preset_name: String,
+    plugin_kind: String,
+    plugin_identifier: String,
+    plugin: Option<crate::db::CachedPluginCore>,
+    content_hash: Option<String>,
+}
+
+impl CachedIniEntry {
+    fn from_entry(e: &PresetEntry) -> Self {
+        Self {
+            preset_name: e.preset_name.clone(),
+            plugin_kind: e.plugin_kind.as_ref().to_string(),
+            plugin_identifier: e.plugin_identifier.clone(),
+            plugin: e.plugin.as_ref().map(crate::db::cached_core_from),
+            content_hash: crate::db::opt_hash_to_hex(e.content_hash),
+        }
+    }
+
+    fn into_entry(self) -> Option<PresetEntry> {
+        Some(PresetEntry {
+            preset_name: self.preset_name,
+            plugin_kind: PluginKind::from_str(&self.plugin_kind).ok()?,
+            plugin_identifier: self.plugin_identifier,
+            plugin: match &self.plugin {
+                Some(c) => Some(crate::db::cached_core_to(c)?),
+                None => None,
+            },
+            content_hash: crate::db::opt_hash_from_hex(&self.content_hash)?,
+        })
+    }
+}
+
 impl Database for IniDatabase {
     fn persistent_id(&self) -> &PersistentDatabaseId {
         &self.persistent_id
@@ -90,6 +127,11 @@ impl Database for IniDatabase {
 
     fn refresh(&mut self, ctx: &ProviderContext) -> Result<(), Box<dyn Error>> {
         let file_name_regex = base::regex!(r#"(?i)(.*?)-(.*).ini"#);
+        // Scan cache: one `.ini` holds many presets, so each file caches a `Vec` blob. On an
+        // unchanged (mtime, size) we rebuild all of that file's entries without reading it.
+        // Best-effort — any miss falls back to parsing. See `POT_DB_DESIGN.md`.
+        let pass = crate::db::pass_ts();
+        let provider_key = self.root_dir.as_str();
         self.entries = WalkDir::new(&self.root_dir)
             .max_depth(1)
             .follow_links(true)
@@ -170,43 +212,78 @@ impl Database for IniDatabase {
                         }
                     }
                 });
-                let ini_file = Ini::load_from_file(entry.path()).ok()?;
+                let path = entry.path();
+                let abs_path = path.to_str();
+                let stat = abs_path.and_then(|_| crate::db::file_stat(path));
+                // Try the cache first: rebuild every preset in this file from the blob.
+                if let (Some(abs), Some((mtime, size))) = (abs_path, stat) {
+                    if let Some(blob) = crate::db::cache_lookup(abs, mtime, size, pass) {
+                        if let Some(entries) = serde_json::from_str::<Vec<CachedIniEntry>>(&blob)
+                            .ok()
+                            .and_then(|v| {
+                                v.into_iter()
+                                    .map(CachedIniEntry::into_entry)
+                                    .collect::<Option<Vec<_>>>()
+                            })
+                        {
+                            return Some(entries);
+                        }
+                    }
+                }
+                // Cache miss: parse the `.ini` and hash each preset.
+                let ini_file = Ini::load_from_file(path).ok()?;
                 let general_section = ini_file.section(Some("General"))?;
                 let nb_presets = general_section.get("NbPresets")?;
                 let preset_count: u32 = nb_presets.parse().ok()?;
                 let plugin_identifier = plugin_identifier.to_string();
-                let iter = (0..preset_count).filter_map(move |i| {
-                    let section_name = format!("Preset{i}");
-                    let section = ini_file.section(Some(section_name))?;
-                    let name = section.get("Name")?;
-                    // Calculate hash. At first add info about the plug-in. Without that info,
-                    // the content could be ambiguous.
-                    let mut hasher = PersistentHasher::new();
-                    let plugin_kind_str = plugin_kind.as_ref();
-                    let plugin_info = format!("{plugin_kind_str}-{plugin_identifier}");
-                    hasher.write(plugin_info.as_bytes());
-                    // Calculate hash out of data properties ("Data", "Data_1", "Data_2", ...)
-                    let data = section.get("Data")?;
-                    hasher.write(data.as_bytes());
-                    let mut i = 1;
-                    while let Some(more_data) = section.get(format!("Data{i}")) {
-                        hasher.write(more_data.as_bytes());
-                        i += 1;
+                let plugin_core = plugin.map(|p| p.common.core);
+                let mut file_entries: Vec<PresetEntry> = Vec::with_capacity(preset_count as usize);
+                for i in 0..preset_count {
+                    // Skip individual malformed presets (missing section/Name/Data) but keep the
+                    // rest of the file — preserves the original per-preset filter_map semantics.
+                    let built = (|| {
+                        let section = ini_file.section(Some(format!("Preset{i}")))?;
+                        let name = section.get("Name")?;
+                        // Calculate hash. At first add info about the plug-in. Without that info,
+                        // the content could be ambiguous.
+                        let mut hasher = PersistentHasher::new();
+                        let plugin_kind_str = plugin_kind.as_ref();
+                        let plugin_info = format!("{plugin_kind_str}-{plugin_identifier}");
+                        hasher.write(plugin_info.as_bytes());
+                        // Calculate hash out of data properties ("Data", "Data_1", "Data_2", ...)
+                        let data = section.get("Data")?;
+                        hasher.write(data.as_bytes());
+                        let mut j = 1;
+                        while let Some(more_data) = section.get(format!("Data{j}")) {
+                            hasher.write(more_data.as_bytes());
+                            j += 1;
+                        }
+                        Some(PresetEntry {
+                            preset_name: name.to_string(),
+                            plugin_kind,
+                            plugin_identifier: plugin_identifier.clone(),
+                            plugin: plugin_core,
+                            content_hash: Some(hasher.digest_128()),
+                        })
+                    })();
+                    if let Some(e) = built {
+                        file_entries.push(e);
                     }
-                    // Build entry
-                    let preset_entry = PresetEntry {
-                        preset_name: name.to_string(),
-                        plugin_kind,
-                        plugin_identifier: plugin_identifier.clone(),
-                        plugin: plugin.map(|p| p.common.core),
-                        content_hash: Some(hasher.digest_128()),
-                    };
-                    Some(preset_entry)
-                });
-                Some(iter)
+                }
+                // Populate the cache for next time.
+                if let (Some(abs), Some((mtime, size))) = (abs_path, stat) {
+                    let cached: Vec<CachedIniEntry> =
+                        file_entries.iter().map(CachedIniEntry::from_entry).collect();
+                    if let Ok(blob) = serde_json::to_string(&cached) {
+                        crate::db::cache_store(abs, mtime, size, provider_key, &blob, pass);
+                    }
+                }
+                Some(file_entries)
             })
             .flatten()
             .collect();
+        // Drop cache rows for `.ini` files that vanished.
+        crate::db::cache_sweep(provider_key, pass);
         Ok(())
     }
 

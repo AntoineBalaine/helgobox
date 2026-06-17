@@ -83,6 +83,18 @@ local recorder = {
   mode = 0,
 }
 
+-- Database Maintenance window state. Lists orphaned preview files (in pot's preview dir but
+-- with no registry entry) and lets the user delete a confirmed subset. `scanned` flips true
+-- after the first scan so we can distinguish "no scan yet" from "scan found nothing".
+-- `checked` maps orphan relative path -> bool (default true). `confirm` gates deletion.
+local maintenance = {
+  open = false,
+  scanned = false,
+  checked = {},
+  confirm = false,
+  last_result = nil, -- e.g. "Deleted 3 file(s)."
+}
+
 local FILTER_WIDTH = 170
 local POPUP_WIDTH = 240
 local LIST_HEIGHT = 200
@@ -725,6 +737,17 @@ local function toolbar()
       recorder.step = 'intro'
     end
   end
+  -- Database Maintenance (only when the standalone extension exposes the DB API).
+  if r.HB_Pot_DbScanOrphans then
+    r.ImGui_SameLine(ctx)
+    if r.ImGui_Button(ctx, 'Maintenance') then
+      maintenance.open = true
+      maintenance.scanned = false
+      maintenance.checked = {}
+      maintenance.confirm = false
+      maintenance.last_result = nil
+    end
+  end
   if r.HB_Pot_IsBusy() ~= 0 then
     r.ImGui_SameLine(ctx)
     r.ImGui_Text(ctx, 'scanning...')
@@ -950,6 +973,122 @@ local function recorder_render()
   r.ImGui_End(ctx)
 end
 
+local function maintenance_close()
+  maintenance.open = false
+end
+
+-- Human-readable byte size.
+local function fmt_size(bytes)
+  if bytes < 1024 then return string.format('%d B', bytes) end
+  if bytes < 1024 * 1024 then return string.format('%.1f KB', bytes / 1024) end
+  return string.format('%.1f MB', bytes / (1024 * 1024))
+end
+
+-- Database Maintenance window: scan for orphaned previews, delete a confirmed subset, and
+-- prune dangling registry rows. Mirrors the safety rule from POT_DB_DESIGN.md: nothing is
+-- deleted without the user explicitly selecting it and confirming.
+local function maintenance_render()
+  r.ImGui_SetNextWindowSize(ctx, 580, 480, r.ImGui_Cond_FirstUseEver())
+  local visible, open = r.ImGui_Begin(ctx, 'Pot Database Maintenance', true)
+  if visible then
+    r.ImGui_TextWrapped(ctx,
+      "Orphaned previews are .ogg files in pot's preview folder that pot no longer tracks. "
+      .. "Pot never deletes them on its own. Anything not listed here is left untouched.")
+    r.ImGui_Separator(ctx)
+    if r.ImGui_Button(ctx, 'Scan for orphaned previews') then
+      r.HB_Pot_DbScanOrphans()
+      maintenance.scanned = true
+      maintenance.checked = {}
+      maintenance.confirm = false
+      maintenance.last_result = nil
+    end
+    r.ImGui_SameLine(ctx)
+    if r.ImGui_Button(ctx, 'Prune dangling registry rows') then
+      local pruned = r.HB_Pot_DbPruneRegistry()
+      maintenance.last_result =
+        string.format('Pruned %d registry row(s) whose file was missing.', pruned)
+    end
+    if r.HB_Pot_DbRebuildIndex then
+      r.ImGui_SameLine(ctx)
+      if r.ImGui_Button(ctx, 'Rebuild index from files') then
+        local registered = r.HB_Pot_DbRebuildIndex()
+        maintenance.last_result = string.format(
+          'Registered %d preview file(s) from disk (reads embedded metadata; also adopts '
+          .. 'pre-existing previews so they are not treated as orphans).', registered)
+        if maintenance.scanned then r.HB_Pot_DbScanOrphans() end
+      end
+    end
+    if maintenance.last_result then
+      r.ImGui_TextColored(ctx, 0x80FF80FF, maintenance.last_result)
+    end
+    if maintenance.scanned then
+      local count = r.HB_Pot_DbOrphanCount()
+      if count <= 0 then
+        r.ImGui_Text(ctx, 'No orphaned previews found.')
+      else
+        r.ImGui_Text(ctx, string.format('%d orphaned preview(s) found.', count))
+        local total, sel_count, sel_size = 0, 0, 0
+        if r.ImGui_BeginChild(ctx, 'orphan_list', 0, 300, 0, 0) then
+          for i = 0, count - 1 do
+            local ok, path = r.HB_Pot_DbOrphanName(i)
+            local size = r.HB_Pot_DbOrphanSize(i)
+            if size < 0 then size = 0 end
+            if ok ~= 0 and path and path ~= '' then
+              total = total + size
+              if maintenance.checked[path] == nil then maintenance.checked[path] = true end
+              local label = string.format('%s  (%s)##orphan%d', path, fmt_size(size), i)
+              local changed, val = r.ImGui_Checkbox(ctx, label, maintenance.checked[path])
+              if changed then maintenance.checked[path] = val end
+              if maintenance.checked[path] then
+                sel_count = sel_count + 1
+                sel_size = sel_size + size
+              end
+            end
+          end
+          r.ImGui_EndChild(ctx)
+        end
+        r.ImGui_Text(ctx, string.format(
+          'Total: %s.  Selected for deletion: %d (%s).',
+          fmt_size(total), sel_count, fmt_size(sel_size)))
+        if not maintenance.confirm then
+          if sel_count > 0 and r.ImGui_Button(ctx, 'Delete selected') then
+            maintenance.confirm = true
+          end
+        else
+          r.ImGui_TextColored(ctx, 0xFF6060FF,
+            string.format('Permanently delete %d file(s)? This cannot be undone.', sel_count))
+          if r.ImGui_Button(ctx, 'Yes, delete') then
+            -- Snapshot the checked paths first; the list is re-scanned right after.
+            local to_delete = {}
+            for i = 0, count - 1 do
+              local ok, path = r.HB_Pot_DbOrphanName(i)
+              if ok ~= 0 and path and path ~= '' and maintenance.checked[path] then
+                to_delete[#to_delete + 1] = path
+              end
+            end
+            local deleted = 0
+            for _, path in ipairs(to_delete) do
+              if r.HB_Pot_DbDeleteOrphan(path) ~= 0 then deleted = deleted + 1 end
+            end
+            r.HB_Pot_DbScanOrphans()
+            maintenance.checked = {}
+            maintenance.confirm = false
+            maintenance.last_result = string.format('Deleted %d file(s).', deleted)
+          end
+          r.ImGui_SameLine(ctx)
+          if r.ImGui_Button(ctx, 'Cancel') then
+            maintenance.confirm = false
+          end
+        end
+      end
+    end
+    r.ImGui_Separator(ctx)
+    if r.ImGui_Button(ctx, 'Close') then maintenance_close() end
+    r.ImGui_End(ctx)
+  end
+  if not open then maintenance_close() end
+end
+
 local function frame()
   toolbar()
   destination_panel()
@@ -1007,6 +1146,7 @@ local function loop()
   -- The wizards are their own windows, drawn outside the main window's scope.
   if crawler.open then crawler_render() end
   if recorder.open then recorder_render() end
+  if maintenance.open then maintenance_render() end
   if open then r.defer(loop) end
 end
 

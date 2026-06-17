@@ -32,6 +32,7 @@ use wildmatch::WildMatch;
 
 mod api;
 pub use api::*;
+pub mod db;
 mod nks;
 mod pot_database;
 use crate::providers::komplete::NksFile;
@@ -50,6 +51,7 @@ pub use worker::*;
 mod escape_catcher;
 pub mod preset_crawler;
 pub mod preset_recorder;
+pub mod preview_maintenance;
 pub mod preview_recorder;
 use crate::preset_crawler::get_shim_file_path;
 use crate::preview_recorder::get_preview_file_path_from_hash;
@@ -1962,8 +1964,28 @@ fn is_audio_file_extension(ext: &str) -> bool {
     matches!(ext, "wav" | "aif" | "ogg" | "mp3")
 }
 
-pub fn preview_exists(preset: &PotPreset, reaper_resource_dir: &Utf8Path) -> bool {
-    find_preview_file(preset, reaper_resource_dir).is_some()
+pub fn preview_exists(preset: &PotPreset, _reaper_resource_dir: &Utf8Path) -> bool {
+    // Audio-file presets are their own preview.
+    if let PotPresetKind::FileBased(kind) = &preset.kind {
+        if is_audio_file_extension(&kind.file_ext) {
+            return kind.path.exists();
+        }
+    }
+    // Recorded preview: a fast indexed registry lookup instead of a per-preset filesystem
+    // stat. This is the dominant cost when building collections over tens of thousands of
+    // presets (the has-preview filter calls this for every preset). A stale registry row
+    // (file deleted outside pot) can yield a false positive, which only mislabels the filter;
+    // orphan GC keeps the registry honest. See `POT_DB_DESIGN.md`.
+    let hash = preset.common.content_or_id_hash();
+    if crate::db::preview_exists(&crate::db::hash_to_hex(hash)) {
+        return true;
+    }
+    // Database-specific preview file.
+    preset
+        .common
+        .db_specific_preview_file
+        .as_ref()
+        .map_or(false, |p| p.exists())
 }
 
 /// This looks up the preview file for the given preset, actually checking for the file's

@@ -1621,6 +1621,73 @@ unsafe extern "C" fn vararg_HB_Pot_RecorderDiscard(_: *mut *mut c_void, _: c_int
     std::ptr::null_mut()
 }
 
+// ---------------------------------------------------------------------------
+// Database maintenance (scan cache + preview registry; orphan GC)
+// ---------------------------------------------------------------------------
+
+extern "C" fn HB_Pot_DbScanOrphans() -> c_int {
+    crate::db_maintenance::scan_orphans()
+}
+unsafe extern "C" fn vararg_HB_Pot_DbScanOrphans(_: *mut *mut c_void, _: c_int) -> *mut c_void {
+    ret_int(HB_Pot_DbScanOrphans())
+}
+
+extern "C" fn HB_Pot_DbOrphanCount() -> c_int {
+    crate::db_maintenance::orphan_count()
+}
+unsafe extern "C" fn vararg_HB_Pot_DbOrphanCount(_: *mut *mut c_void, _: c_int) -> *mut c_void {
+    ret_int(HB_Pot_DbOrphanCount())
+}
+
+extern "C" fn HB_Pot_DbOrphanName(index: c_int, buf: *mut c_char, buf_sz: c_int) -> c_int {
+    crate::db_maintenance::with_orphan_name(index, |name| unsafe {
+        copy_to_buf(name, buf, buf_sz) as c_int
+    })
+    .unwrap_or(0)
+}
+unsafe extern "C" fn vararg_HB_Pot_DbOrphanName(args: *mut *mut c_void, n: c_int) -> *mut c_void {
+    ret_int(HB_Pot_DbOrphanName(
+        int_arg(args, n, 0),
+        buf_arg(args, n, 1),
+        int_arg(args, n, 2),
+    ))
+}
+
+extern "C" fn HB_Pot_DbOrphanSize(index: c_int) -> c_int {
+    crate::db_maintenance::orphan_size(index)
+}
+unsafe extern "C" fn vararg_HB_Pot_DbOrphanSize(args: *mut *mut c_void, n: c_int) -> *mut c_void {
+    ret_int(HB_Pot_DbOrphanSize(int_arg(args, n, 0)))
+}
+
+extern "C" fn HB_Pot_DbDeleteOrphan(rel_path: *const c_char) -> c_int {
+    if rel_path.is_null() {
+        return 0;
+    }
+    let rel = unsafe { CStr::from_ptr(rel_path) }.to_string_lossy();
+    crate::db_maintenance::delete_orphan(&rel)
+}
+unsafe extern "C" fn vararg_HB_Pot_DbDeleteOrphan(args: *mut *mut c_void, n: c_int) -> *mut c_void {
+    let rel = str_arg(args, n, 0)
+        .map(|s| s.as_ptr())
+        .unwrap_or(std::ptr::null());
+    ret_int(HB_Pot_DbDeleteOrphan(rel))
+}
+
+extern "C" fn HB_Pot_DbPruneRegistry() -> c_int {
+    crate::db_maintenance::prune_registry()
+}
+unsafe extern "C" fn vararg_HB_Pot_DbPruneRegistry(_: *mut *mut c_void, _: c_int) -> *mut c_void {
+    ret_int(HB_Pot_DbPruneRegistry())
+}
+
+extern "C" fn HB_Pot_DbRebuildIndex() -> c_int {
+    crate::db_maintenance::rebuild_index()
+}
+unsafe extern "C" fn vararg_HB_Pot_DbRebuildIndex(_: *mut *mut c_void, _: c_int) -> *mut c_void {
+    ret_int(HB_Pot_DbRebuildIndex())
+}
+
 // ============================================================================
 // Registration
 // ============================================================================
@@ -1742,6 +1809,13 @@ macro_rules! paste_vararg {
     (HB_Pot_RecorderExportDir) => { vararg_HB_Pot_RecorderExportDir };
     (HB_Pot_RecorderError) => { vararg_HB_Pot_RecorderError };
     (HB_Pot_RecorderDiscard) => { vararg_HB_Pot_RecorderDiscard };
+    (HB_Pot_DbScanOrphans) => { vararg_HB_Pot_DbScanOrphans };
+    (HB_Pot_DbOrphanCount) => { vararg_HB_Pot_DbOrphanCount };
+    (HB_Pot_DbOrphanName) => { vararg_HB_Pot_DbOrphanName };
+    (HB_Pot_DbOrphanSize) => { vararg_HB_Pot_DbOrphanSize };
+    (HB_Pot_DbDeleteOrphan) => { vararg_HB_Pot_DbDeleteOrphan };
+    (HB_Pot_DbPruneRegistry) => { vararg_HB_Pot_DbPruneRegistry };
+    (HB_Pot_DbRebuildIndex) => { vararg_HB_Pot_DbRebuildIndex };
 }
 
 fn pot_api_fns() -> Vec<PotApiFn> {
@@ -1926,6 +2000,20 @@ fn pot_api_fns() -> Vec<PotApiFn> {
             b"int\0char*,int\0errorOut,errorOut_sz\0Gets the last recorder error message. Returns 0 if there was none.\0";
         HB_Pot_RecorderDiscard:
             b"void\0\0\0Discards the current recorder session.\0";
+        HB_Pot_DbScanOrphans:
+            b"int\0\0\0Scans pot's preview directory for orphaned preview files (.ogg files with no registry entry), caches the result, and returns the count. An orphan is a preview pot no longer tracks; nothing is deleted by this call.\0";
+        HB_Pot_DbOrphanCount:
+            b"int\0\0\0Returns the number of orphans found by the last HB_Pot_DbScanOrphans call.\0";
+        HB_Pot_DbOrphanName:
+            b"int\0int,char*,int\0index,pathOut,pathOut_sz\0Gets the preview-root-relative path of the orphan at the given index. Returns 0 on failure.\0";
+        HB_Pot_DbOrphanSize:
+            b"int\0int\0index\0Returns the size in bytes of the orphan at the given index, or -1 if out of range.\0";
+        HB_Pot_DbDeleteOrphan:
+            b"int\0const char*\0rel_path\0Deletes a single orphaned preview file by its preview-root-relative path (as returned by HB_Pot_DbOrphanName). Returns 1 on success, 0 on failure. Only ever call this for paths the user explicitly confirmed.\0";
+        HB_Pot_DbPruneRegistry:
+            b"int\0\0\0Removes preview registry rows whose file no longer exists on disk (e.g. deleted outside pot), keeping the has-preview filter accurate. Returns the number of rows pruned.\0";
+        HB_Pot_DbRebuildIndex:
+            b"int\0\0\0Rebuilds the preview registry from the .ogg files on disk: derives each preview's hash from its filename and reads its embedded Vorbis metadata. Doubles as the one-time adoption pass for previews that predate the registry (so they are not mistaken for orphans). Returns the number of files registered.\0";
     ]
 }
 

@@ -1,0 +1,17 @@
+[package]
+name = "pot-db"
+version = "0.1.0"
+authors = ["Benjamin Klum <benjamin.klum@helgoboss.org>"]
+edition = "2021"
+publish = false
+
+# SQLite-backed scan cache + preview registry for the pot engine. Intentionally free of any
+# `pot` types: it stores opaque serialized blobs and primitive columns, so it compiles fast
+# and in isolation. The `pot` crate owns the live connection and does all (de)serialization
+# of provider preset entries. See POT_DB_DESIGN.md.
+
+[dependencies]
+rusqlite = { workspace = true, features = ["bundled"] }
+
+[lints.clippy]
+enum_glob_use = "deny"

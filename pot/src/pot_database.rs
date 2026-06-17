@@ -146,6 +146,26 @@ impl PotDatabase {
         self.detected_legacy_vst3_scan
             .store(plugin_db.detected_legacy_vst3_scan(), Ordering::Relaxed);
         let provider_context = ProviderContext::new(&plugin_db);
+        // Invalidate the scan cache if the installed plug-in set changed. Cached preset
+        // entries store *resolved* plugins (which depend on the plug-in DB), so a changed
+        // plug-in set must force a one-shot full rescan. The token is an order-independent
+        // hash of the installed plug-in ids. See `POT_DB_DESIGN.md`.
+        {
+            use base::hash_util::PersistentHasher;
+            use std::hash::Hasher;
+            let mut ids: Vec<String> = plugin_db
+                .plugins()
+                .map(|p| format!("{:?}", p.common.core.id))
+                .collect();
+            ids.sort_unstable();
+            let mut hasher = PersistentHasher::new();
+            for id in &ids {
+                hasher.write(id.as_bytes());
+                hasher.write(&[0]);
+            }
+            let token = format!("{:032x}", hasher.digest_128().get());
+            crate::db::sync_generation("plugin_set", &token);
+        }
         // Refresh databases
         for db in self.read_lock_databases().values() {
             let mut db = blocking_write_lock(db, "pot db refresh provider db");
