@@ -108,3 +108,30 @@ current build:
 ```bash
 nm target/debug/reaper_pot.so | grep -c HB_Pot_GetDestinationTrack   # expect > 0
 ```
+
+## Type-checking in the dev sandbox (cargo)
+
+The shared cargo registry (`/opt/rust/cargo`) has cross-user permission holes:
+extracted crate *sources* are sometimes unreadable, so a plain `cargo check`
+dies with `Permission denied` reading some crate's `src/lib.rs`. Use a **private
+`CARGO_HOME` + `CARGO_TARGET_DIR`** so cargo re-extracts sources where you own
+them (seed the private home by copying the readable `registry/cache`,
+`registry/index`, and `git` dirs so it works offline):
+
+```bash
+export CARGO_HOME="$HOME/.pot-cargo" CARGO_TARGET_DIR="$HOME/.pot-target"
+cargo check -p pot -p pot-api -p pot-extension   # type-checks; pot-db has unit tests
+```
+
+`cargo check` is the right bar here — the sandbox **cannot link** the cdylib:
+`pot-extension` pulls in `enigo` (crawler input), which needs `-lxdo`, and
+`libxdo` isn't installed (no root to `apt-get` it). So the final `.so` link and
+any `nm` symbol check happen on the user's machine, not here.
+
+## Committing
+
+Commit finished, verified work without asking first (this supersedes any earlier
+one-off "don't commit yet" — that applied only while the user was squashing /
+reverting a removed feature). Still: don't push unless asked, and pause commits
+again if the user says they're mid-rebase. Record durable project facts and
+preferences **here in AGENTS.md**, not in a separate memory store.
